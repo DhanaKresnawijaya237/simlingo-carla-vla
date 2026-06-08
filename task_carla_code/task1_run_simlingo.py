@@ -22,6 +22,7 @@ import numpy as np
 
 
 BASIC_COMMANDS = ("turn left", "turn right", "straight", "stop", "speed up", "slow down")
+SPEED_EVAL_COMMANDS = ("stop", "speed up", "slow down")
 
 
 class FallbackRoadOption(IntEnum):
@@ -304,6 +305,12 @@ class Task1SimLingoRunner:
             self.RoadOption = FallbackRoadOption
         else:
             self.RoadOption = self.policy.RoadOption
+        self.velocity_head = None
+        if args.velocity_head_checkpoint is not None:
+            from task_carla_code.task1_velocity_head import VelocityHeadRuntime
+
+            self.velocity_head = VelocityHeadRuntime(args.velocity_head_checkpoint, device=args.velocity_head_device)
+            print(f"Loaded Task 1 velocity head: {args.velocity_head_checkpoint}", flush=True)
 
     def run(self) -> int:
         if self.args.command:
@@ -321,6 +328,20 @@ class Task1SimLingoRunner:
                     self.args.duration = original_duration
         self.write_eval_summary(results)
         return 0 if all(r.success for r in results) else 1
+
+    def predict_velocity_head_speed(self, command: str, vehicle: Any, previous_control: Any | None) -> float | None:
+        if self.velocity_head is None:
+            return None
+        previous_steer = float(previous_control.steer) if previous_control is not None else 0.0
+        previous_throttle = float(previous_control.throttle) if previous_control is not None else 0.0
+        previous_brake = float(previous_control.brake) if previous_control is not None else 0.0
+        return self.velocity_head.predict(
+            command=command,
+            current_speed_mps=speed_mps(vehicle),
+            previous_steer=previous_steer,
+            previous_throttle=previous_throttle,
+            previous_brake=previous_brake,
+        )
 
     def run_trial(self, command: str, trial_index: int) -> TrialResult:
         run_dir = self.output_dir / safe_name(command) / f"trial_{trial_index:03d}"
@@ -374,8 +395,9 @@ class Task1SimLingoRunner:
             prime_policy_calls = 0
             prime_policy_latency_sec = 0.0
             if self.args.prime_policy_before_start:
+                prime_active_command = None if command in SPEED_EVAL_COMMANDS and command_warmup_sec(command, self.args) > 0.0 else command
                 for prime_index in range(max(1, int(self.args.prime_policy_steps))):
-                    self.policy.set_active_command(command)
+                    self.policy.set_active_command(prime_active_command)
                     input_data = self.build_input_data(vehicle, rgb_image)
                     t0 = time.time()
                     _ = self.policy.run_step(input_data, -float(prime_index + 1) / float(self.args.sim_fps))
@@ -390,15 +412,18 @@ class Task1SimLingoRunner:
             start_location = start_transform.location
             start_yaw = start_transform.rotation.yaw
             speeds: list[float] = []
+            baseline_speeds: list[float] = []
             post_command_speeds: list[float] = []
             offroad_frames = 0
             success_hold = 0
             reached_success_step: int | None = None
             termination_reason: str | None = None
-            min_required_hold = max(1, int(round(self.args.success_hold_sec * self.args.sim_fps)))
+            hold_sec = self.args.speed_hold_sec if command in SPEED_EVAL_COMMANDS else self.args.success_hold_sec
+            min_required_hold = max(1, int(round(hold_sec * self.args.sim_fps)))
             warmup_sec = command_warmup_sec(command, self.args)
-            if self.args.simlingo_input_mode == "strict-command":
+            if self.args.simlingo_input_mode == "strict-command" and command not in SPEED_EVAL_COMMANDS:
                 warmup_sec = 0.0
+            command_start_step = int(round(warmup_sec * self.args.sim_fps))
 
             total_steps = int(round(self.args.duration * self.args.sim_fps))
             policy_interval = max(1, int(round(self.args.sim_fps / max(0.1, float(self.args.policy_hz)))))
@@ -410,6 +435,7 @@ class Task1SimLingoRunner:
             cached_world_route = np.zeros((0, 2), dtype=np.float32)
             cached_route_created_step: int | None = None
             cached_model_target_speed_mps: float | None = None
+            velocity_head_target_speed_mps: float | None = None
             cached_follow_diag: dict[str, Any] = {}
             cached_route_update_diag: dict[str, Any] = {}
             rate_limit_diag: dict[str, Any] = {}
@@ -417,8 +443,23 @@ class Task1SimLingoRunner:
                 for step in range(total_steps):
                     timestamp = step / float(self.args.sim_fps)
                     active_command = command if timestamp >= warmup_sec else None
+                    execution_command = active_command if active_command is not None else "straight"
+                    cached_route_ahead_points = count_cached_route_ahead_points(cached_world_route, vehicle.get_transform())
+                    route_exhausted_refresh = bool(
+                        self.args.refresh_policy_on_route_exhaustion
+                        and self.args.simlingo_execution_mode == "cached-route-follower"
+                        and active_command is not None
+                        and cached_world_route.size > 0
+                        and cached_route_ahead_points <= self.args.min_cached_route_ahead_points
+                    )
+                    command_just_started = bool(
+                        self.args.force_policy_on_command_change
+                        and command in SPEED_EVAL_COMMANDS
+                        and warmup_sec > 0.0
+                        and step == command_start_step
+                    )
                     self.policy.set_active_command(active_command)
-                    fresh_policy = step == 0 or (step % policy_interval == 0)
+                    fresh_policy = step == 0 or command_just_started or route_exhausted_refresh or (step % policy_interval == 0)
                     if fresh_policy:
                         policy_calls += 1
                         input_data = self.build_input_data(vehicle, rgb_image)
@@ -439,10 +480,12 @@ class Task1SimLingoRunner:
                         if predicted_route.size > 0:
                             route_transform = vehicle.get_transform()
                             old_local_route = world_route_to_local(cached_world_route, route_transform)
+                            predicted_route_diag = route_lateral_diagnostics(predicted_route)
                             if (
                                 self.args.simlingo_execution_mode == "cached-route-follower"
                                 and cached_world_route.size > 0
                                 and float(self.args.cached_route_blend_new_weight) < 0.999
+                                and not command_just_started
                             ):
                                 cached_local_route = blend_local_routes(
                                     old_local_route,
@@ -460,6 +503,7 @@ class Task1SimLingoRunner:
                                 "cached_route_blend_new_weight": float(self.args.cached_route_blend_new_weight),
                                 "new_route_first": predicted_route[0].tolist(),
                                 "new_route_last": predicted_route[-1].tolist(),
+                                "new_route_lateral_diag": predicted_route_diag,
                                 "model_target_speed_mps": cached_model_target_speed_mps,
                                 "old_route_points_ahead": int(np.sum(old_local_route[:, 0] > 0.25))
                                 if old_local_route.size
@@ -474,13 +518,19 @@ class Task1SimLingoRunner:
                                 flush=True,
                             )
                     if self.args.simlingo_execution_mode == "cached-route-follower":
+                        velocity_head_target_speed_mps = self.predict_velocity_head_speed(
+                            command=execution_command,
+                            vehicle=vehicle,
+                            previous_control=previous_control,
+                        )
                         control, cached_follow_diag = follow_cached_route(
                             vehicle,
                             cached_world_route,
-                            active_command or command,
+                            execution_command,
                             self.args,
                             self.carla,
                             cached_model_target_speed_mps,
+                            velocity_head_target_speed_mps,
                         )
                         control, rate_limit_diag = rate_limit_control(control, previous_control, self.args, self.carla)
                     vehicle.apply_control(control)
@@ -505,7 +555,9 @@ class Task1SimLingoRunner:
 
                     speed = speed_mps(vehicle)
                     speeds.append(speed)
-                    if timestamp >= warmup_sec:
+                    if timestamp < warmup_sec:
+                        baseline_speeds.append(speed)
+                    else:
                         post_command_speeds.append(speed)
                     transform = vehicle.get_transform()
                     offroad = not is_vehicle_on_driving_lane(self.map, transform.location, self.carla)
@@ -525,6 +577,7 @@ class Task1SimLingoRunner:
                         start_yaw=start_yaw,
                         start_location=start_location,
                         speeds=speeds,
+                        baseline_speeds=baseline_speeds,
                         post_command_speeds=post_command_speeds,
                         offroad_frames=offroad_frames,
                         collision_count=len(collision_events),
@@ -548,7 +601,15 @@ class Task1SimLingoRunner:
                         "time_sec": timestamp,
                         "command": command,
                         "active_command": active_command,
+                        "execution_command": execution_command,
+                        "speed_test_phase": "command" if active_command is not None else "baseline",
                         "warmup_sec": warmup_sec,
+                        "command_start_step": command_start_step,
+                        "command_just_started": command_just_started,
+                        "route_exhausted_refresh": route_exhausted_refresh,
+                        "cached_route_ahead_points": cached_route_ahead_points,
+                        "speed_baseline_window_sec": float(self.args.speed_baseline_window_sec),
+                        "speed_hold_sec": float(hold_sec),
                         "prompt": diag.get("prompt"),
                         "prompt_task": diag.get("prompt_task"),
                         "model_input_mode": diag.get("model_input_mode"),
@@ -556,6 +617,7 @@ class Task1SimLingoRunner:
                         "strict_command_only": diag.get("strict_command_only"),
                         "controller_inference_mode": diag.get("controller_inference_mode"),
                         "speed_control_mode": diag.get("speed_control_mode"),
+                        "force_policy_on_command_change": bool(self.args.force_policy_on_command_change),
                         "route_speed_scale": diag.get("route_speed_scale"),
                         "max_throttle": diag.get("max_throttle"),
                         "brake_ratio": diag.get("brake_ratio"),
@@ -570,6 +632,7 @@ class Task1SimLingoRunner:
                         else int(step - cached_route_created_step),
                         "cached_route_points": int(len(cached_world_route)),
                         "cached_follow": cached_follow_diag,
+                        "velocity_head_target_speed_mps": velocity_head_target_speed_mps,
                         "cached_route_update": cached_route_update_diag if fresh_policy else None,
                         "control_rate_limit": rate_limit_diag,
                         "target_points": diag.get("target_points"),
@@ -624,6 +687,7 @@ class Task1SimLingoRunner:
                 start_yaw=start_yaw,
                 speeds=speeds,
                 post_command_speeds=post_command_speeds,
+                baseline_speeds=baseline_speeds,
                 offroad_frames=offroad_frames,
                 collision_events=collision_events,
                 frames=len(frames_for_video),
@@ -642,6 +706,16 @@ class Task1SimLingoRunner:
                         "route_tensors_in_model_input": self.args.simlingo_input_mode != "strict-command",
                         "controller_inference_mode": self.args.simlingo_controller_inference_mode,
                         "speed_control_mode": self.args.simlingo_speed_control_mode,
+                        "command_warmup_sec": warmup_sec,
+                        "speed_baseline_window_sec": self.args.speed_baseline_window_sec,
+                        "speed_hold_sec": hold_sec,
+                        "speed_delta_threshold": self.args.speed_delta_threshold,
+                        "stop_speed_threshold": self.args.stop_speed_threshold,
+                        "stop_baseline_min_speed_mps": self.args.stop_baseline_min_speed_mps,
+                        "slowdown_min_success_speed_mps": self.args.slowdown_min_success_speed_mps,
+                        "force_policy_on_command_change": self.args.force_policy_on_command_change,
+                        "refresh_policy_on_route_exhaustion": self.args.refresh_policy_on_route_exhaustion,
+                        "min_cached_route_ahead_points": self.args.min_cached_route_ahead_points,
                         "route_speed_scale": self.args.task1_route_speed_scale,
                         "max_throttle": self.args.task1_max_throttle,
                         "brake_ratio": self.args.task1_brake_ratio,
@@ -696,6 +770,7 @@ class Task1SimLingoRunner:
         start_yaw: float,
         speeds: list[float],
         post_command_speeds: list[float],
+        baseline_speeds: list[float],
         offroad_frames: int,
         collision_events: list[dict[str, Any]],
         frames: int,
@@ -714,6 +789,7 @@ class Task1SimLingoRunner:
             start_yaw=start_yaw,
             start_location=start_location,
             speeds=speeds,
+            baseline_speeds=baseline_speeds,
             post_command_speeds=post_command_speeds,
             offroad_frames=offroad_frames,
             collision_count=len(collision_events),
@@ -755,6 +831,7 @@ class Task1SimLingoRunner:
         start_yaw: float,
         start_location: Any,
         speeds: list[float],
+        baseline_speeds: list[float],
         post_command_speeds: list[float],
         offroad_frames: int,
         collision_count: int,
@@ -765,7 +842,10 @@ class Task1SimLingoRunner:
         post_min = min(post_command_speeds) if post_command_speeds else speed_now
         post_max = max(post_command_speeds) if post_command_speeds else speed_now
         initial_speed = speeds[0] if speeds else 0.0
-        warmup_speed = speeds[int(min(len(speeds) - 1, max(0, round(command_warmup_sec(command, self.args) * self.args.sim_fps))))] if speeds else 0.0
+        baseline_count = max(1, int(round(self.args.speed_baseline_window_sec * self.args.sim_fps)))
+        baseline_window = baseline_speeds[-baseline_count:] if baseline_speeds else []
+        baseline_speed = float(sum(baseline_window) / len(baseline_window)) if baseline_window else initial_speed
+        warmup_speed = baseline_speed
         heading_delta = angle_delta_deg(start_yaw, transform.rotation.yaw)
         distance = distance_2d(start_location, transform.location)
         lane_wp = self.map.get_waypoint(
@@ -806,14 +886,32 @@ class Task1SimLingoRunner:
             ok = distance >= self.args.straight_min_distance and abs(heading_delta) <= self.args.straight_max_heading
             reason = f"distance={distance:.2f}, heading_delta={heading_delta:.2f}"
         elif command == "stop":
-            ok = len(post_command_speeds) > 0 and speed_now <= self.args.stop_speed_threshold
-            reason = f"final_speed={speed_now:.2f}"
+            ok = (
+                len(post_command_speeds) > 0
+                and baseline_speed >= self.args.stop_baseline_min_speed_mps
+                and speed_now <= self.args.stop_speed_threshold
+            )
+            reason = (
+                f"baseline_speed={baseline_speed:.2f}, speed_now={speed_now:.2f}, "
+                f"threshold={self.args.stop_speed_threshold:.2f}"
+            )
         elif command == "speed up":
-            ok = len(post_command_speeds) > 0 and post_max - initial_speed >= self.args.speed_delta_threshold
-            reason = f"initial_speed={initial_speed:.2f}, post_max={post_max:.2f}"
+            ok = len(post_command_speeds) > 0 and speed_now >= baseline_speed + self.args.speed_delta_threshold
+            reason = (
+                f"baseline_speed={baseline_speed:.2f}, speed_now={speed_now:.2f}, "
+                f"post_max={post_max:.2f}, required_delta={self.args.speed_delta_threshold:.2f}"
+            )
         elif command == "slow down":
-            ok = len(post_command_speeds) > 0 and initial_speed - post_min >= self.args.speed_delta_threshold
-            reason = f"initial_speed={initial_speed:.2f}, post_min={post_min:.2f}"
+            ok = (
+                len(post_command_speeds) > 0
+                and speed_now <= baseline_speed - self.args.speed_delta_threshold
+                and speed_now >= self.args.slowdown_min_success_speed_mps
+            )
+            reason = (
+                f"baseline_speed={baseline_speed:.2f}, speed_now={speed_now:.2f}, "
+                f"post_min={post_min:.2f}, required_delta={self.args.speed_delta_threshold:.2f}, "
+                f"min_moving_speed={self.args.slowdown_min_success_speed_mps:.2f}"
+            )
         else:
             ok = False
             reason = f"unsupported command {command}"
@@ -828,6 +926,11 @@ class Task1SimLingoRunner:
             "max_speed_mps": float(max_speed),
             "initial_speed_mps": float(initial_speed),
             "warmup_speed_mps": float(warmup_speed),
+            "baseline_speed_mps": float(baseline_speed),
+            "post_command_min_speed_mps": float(post_min),
+            "post_command_max_speed_mps": float(post_max),
+            "baseline_sample_count": int(len(baseline_speeds)),
+            "post_command_sample_count": int(len(post_command_speeds)),
         }
 
     def target_road_status(
@@ -1057,6 +1160,9 @@ class Task1SimLingoRunner:
                 continue
             if command == "straight" and abs(meta.get("route_heading_delta_deg", 0.0)) > self.args.straight_route_max_heading:
                 last_error = f"straight route drifts {meta.get('route_heading_delta_deg')}"
+                continue
+            if command in SPEED_EVAL_COMMANDS and abs(meta.get("route_heading_delta_deg", 0.0)) > self.args.speed_route_max_heading:
+                last_error = f"speed route drifts {meta.get('route_heading_delta_deg')}"
                 continue
             scenario = {
                 "map": self.map.name,
@@ -1429,11 +1535,11 @@ def command_prompt(command: str | None) -> str | None:
     if command == "straight":
         return "Command: go straight at the next intersection."
     if command == "stop":
-        return "Command: Stop now due to the <OBJECT>"
+        return "Command: continue following your current lane and brake to a complete stop."
     if command == "speed up":
-        return "Command: accelerate."
+        return "Command: continue following your current lane and speed up."
     if command == "slow down":
-        return "Command: decelerate."
+        return "Command: continue following your current lane and slow down."
     return None
 
 
@@ -1532,6 +1638,32 @@ def world_route_to_local(points: np.ndarray, transform: Any) -> np.ndarray:
     return np.stack([delta @ forward, delta @ right], axis=1).astype(np.float32)
 
 
+def count_cached_route_ahead_points(world_points: np.ndarray, transform: Any) -> int:
+    if world_points.size == 0:
+        return 0
+    local = world_route_to_local(world_points, transform)
+    return int(np.sum(local[:, 0] > 0.25))
+
+
+def route_lateral_diagnostics(local_points: np.ndarray) -> dict[str, float | int]:
+    if local_points.size == 0:
+        return {
+            "points": 0,
+            "last_y_right_m": 0.0,
+            "min_y_right_m": 0.0,
+            "max_y_right_m": 0.0,
+            "mean_abs_y_right_m": 0.0,
+        }
+    y = local_points[:, 1]
+    return {
+        "points": int(len(local_points)),
+        "last_y_right_m": float(y[-1]),
+        "min_y_right_m": float(np.min(y)),
+        "max_y_right_m": float(np.max(y)),
+        "mean_abs_y_right_m": float(np.mean(np.abs(y))),
+    }
+
+
 def rate_limit_control(control: Any, previous: Any, args: argparse.Namespace, carla_module: Any) -> tuple[Any, dict[str, float]]:
     if previous is None:
         return control, {"steer_delta_limited": 0.0, "raw_steer": float(control.steer)}
@@ -1566,6 +1698,7 @@ def follow_cached_route(
     args: argparse.Namespace,
     carla_module: Any,
     model_target_speed_mps: float | None = None,
+    velocity_head_target_speed_mps: float | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     transform = vehicle.get_transform()
     local = world_route_to_local(world_points, transform)
@@ -1591,7 +1724,10 @@ def follow_cached_route(
     steer = float(np.clip(float(args.cached_route_steer_gain) * angle, -args.cached_route_max_steer, args.cached_route_max_steer))
 
     speed_source = "command"
-    if args.simlingo_speed_control_mode == "model" and model_target_speed_mps is not None:
+    if velocity_head_target_speed_mps is not None:
+        target_speed = float(np.clip(velocity_head_target_speed_mps, args.velocity_head_min_speed_mps, args.velocity_head_max_speed_mps))
+        speed_source = "velocity_head"
+    elif args.simlingo_speed_control_mode == "model" and model_target_speed_mps is not None:
         target_speed = float(np.clip(model_target_speed_mps, 0.0, args.cached_route_fast_speed_mps))
         speed_source = "model"
     elif command == "stop":
@@ -1620,6 +1756,7 @@ def follow_cached_route(
         "cached_lookahead_m": lookahead,
         "cached_target_speed_mps": target_speed,
         "cached_model_target_speed_mps": model_target_speed_mps,
+        "cached_velocity_head_target_speed_mps": velocity_head_target_speed_mps,
         "cached_speed_source": speed_source,
         "cached_reason": "ok",
     }
@@ -1927,6 +2064,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=pathlib.Path)
     parser.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("logs/task1/simlingo"))
     parser.add_argument("--mode", choices=("run", "camera-smoke", "smoke-model", "debug-imports"), default="run")
+    parser.add_argument("--velocity-head-checkpoint", type=pathlib.Path)
+    parser.add_argument("--velocity-head-device", default="cpu")
+    parser.add_argument("--velocity-head-min-speed-mps", type=float, default=0.0)
+    parser.add_argument("--velocity-head-max-speed-mps", type=float, default=8.0)
     parser.add_argument(
         "--simlingo-input-mode",
         choices=("target_point_command", "command", "strict-command"),
@@ -2020,6 +2161,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cached-route-brake-gain", type=float, default=0.35)
     parser.add_argument("--cached-route-max-brake", type=float, default=0.6)
     parser.add_argument("--cached-route-brake-margin-mps", type=float, default=0.7)
+    parser.add_argument(
+        "--refresh-policy-on-route-exhaustion",
+        action="store_true",
+        default=True,
+        help="Refresh SimLingo immediately when the cached trajectory has too few points ahead.",
+    )
+    parser.add_argument(
+        "--no-refresh-policy-on-route-exhaustion",
+        dest="refresh_policy_on_route_exhaustion",
+        action="store_false",
+    )
+    parser.add_argument("--min-cached-route-ahead-points", type=int, default=3)
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--command", choices=BASIC_COMMANDS)
@@ -2072,6 +2225,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--route-planner-max-distance", type=float, default=80.0)
     parser.add_argument("--junction-min-turn-deg", type=float, default=35.0)
     parser.add_argument("--straight-route-max-heading", type=float, default=12.0)
+    parser.add_argument("--speed-route-max-heading", type=float, default=8.0)
 
     parser.add_argument("--target-success-rate", type=float, default=0.80)
     parser.add_argument("--success-hold-sec", type=float, default=1.0)
@@ -2102,7 +2256,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-speed-threshold", type=float, default=0.35)
     parser.add_argument("--stop-warmup-sec", type=float, default=3.0)
     parser.add_argument("--speed-command-warmup-sec", type=float, default=3.0)
+    parser.add_argument(
+        "--speed-baseline-window-sec",
+        type=float,
+        default=1.5,
+        help="For stop/speed-up/slow-down, compare command response against this final slice of neutral driving.",
+    )
+    parser.add_argument(
+        "--speed-hold-sec",
+        type=float,
+        default=2.0,
+        help="For stop/speed-up/slow-down, require the speed condition to remain true for this long.",
+    )
+    parser.add_argument(
+        "--stop-baseline-min-speed-mps",
+        type=float,
+        default=1.0,
+        help="Stop command only counts after the neutral baseline phase proves the car was moving first.",
+    )
     parser.add_argument("--speed-delta-threshold", type=float, default=0.8)
+    parser.add_argument(
+        "--slowdown-min-success-speed-mps",
+        type=float,
+        default=1.0,
+        help="Slow-down success requires the car to remain moving at least this fast.",
+    )
+    parser.add_argument(
+        "--force-policy-on-command-change",
+        action="store_true",
+        default=True,
+        help="Force a fresh SimLingo call on the tick where stop/speed-up/slow-down becomes active.",
+    )
+    parser.add_argument(
+        "--no-force-policy-on-command-change",
+        dest="force_policy_on_command_change",
+        action="store_false",
+    )
     return parser
 
 

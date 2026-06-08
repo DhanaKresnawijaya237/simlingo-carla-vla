@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ "$#" -lt 2 ]; then
-    echo "Usage: bash task1_run_by_job.sh <carla_job_id|latest|none> <run|camera-smoke|debug-imports|smoke-model|official-route-smoke> [args...]"
+    echo "Usage: bash task1_run_by_job.sh <carla_job_id|latest|none> <run|camera-smoke|debug-imports|smoke-model|train-velocity-head|official-route-smoke> [args...]"
     exit 2
 fi
 
@@ -118,6 +118,10 @@ case "$MODE" in
         ;;
     smoke-model)
         python task_carla_code/task1_run_simlingo.py --mode smoke-model "$@"
+        exit $?
+        ;;
+    train-velocity-head)
+        python task_carla_code/task1_train_velocity_head.py "$@"
         exit $?
         ;;
 esac

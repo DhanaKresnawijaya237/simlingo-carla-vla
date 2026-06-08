@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Small scalar velocity head for Task 1 explicit speed commands."""
+
+from __future__ import annotations
+
+import json
+import math
+import pathlib
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+
+
+BASIC_COMMANDS = ("turn left", "turn right", "straight", "stop", "speed up", "slow down")
+FEATURE_NAMES = (
+    "command_turn_left",
+    "command_turn_right",
+    "command_straight",
+    "command_stop",
+    "command_speed_up",
+    "command_slow_down",
+    "current_speed_mps",
+    "previous_steer",
+    "previous_throttle",
+    "previous_brake",
+)
+
+
+def command_to_index(command: str) -> int:
+    normalized = command.strip().lower().replace("_", " ")
+    if normalized not in BASIC_COMMANDS:
+        raise ValueError(f"Unsupported command {command!r}")
+    return BASIC_COMMANDS.index(normalized)
+
+
+def build_velocity_features(
+    command: str,
+    current_speed_mps: float,
+    previous_steer: float = 0.0,
+    previous_throttle: float = 0.0,
+    previous_brake: float = 0.0,
+) -> np.ndarray:
+    features = np.zeros((len(FEATURE_NAMES),), dtype=np.float32)
+    features[command_to_index(command)] = 1.0
+    features[6] = float(current_speed_mps)
+    features[7] = float(previous_steer)
+    features[8] = float(previous_throttle)
+    features[9] = float(previous_brake)
+    return features
+
+
+def annotation_features(sample: dict[str, Any]) -> np.ndarray:
+    ego_state = sample.get("ego_state") or {}
+    control = sample.get("control") or {}
+    return build_velocity_features(
+        str(sample.get("command", "")),
+        float(ego_state.get("speed_mps", 0.0)),
+        float(control.get("steer", 0.0)),
+        float(control.get("throttle", 0.0)),
+        float(control.get("brake", 0.0)),
+    )
+
+
+def target_speed_from_annotation(sample: dict[str, Any], future_dt: float = 0.4, waypoint_gap: int = 2) -> float | None:
+    trajectory = sample.get("trajectory")
+    if not isinstance(trajectory, list) or len(trajectory) <= waypoint_gap:
+        return None
+    try:
+        p0 = np.asarray(trajectory[0][:2], dtype=np.float32)
+        p1 = np.asarray(trajectory[waypoint_gap][:2], dtype=np.float32)
+    except Exception:
+        return None
+    dt = max(1e-6, float(future_dt) * float(waypoint_gap))
+    speed = float(np.linalg.norm(p1 - p0) / dt)
+    if not math.isfinite(speed):
+        return None
+    return max(0.0, speed)
+
+
+def load_annotations(path: pathlib.Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected dict annotations at {path}")
+    return data
+
+
+def split_annotation_path(data_root: pathlib.Path, split: str) -> pathlib.Path:
+    direct = data_root / split / "annotations.json"
+    if direct.exists():
+        return direct
+    fallback = data_root / "annotations.json"
+    if split == "train" and fallback.exists():
+        return fallback
+    raise FileNotFoundError(f"Could not find annotations for split {split!r} under {data_root}")
+
+
+@dataclass
+class VelocityHeadConfig:
+    feature_names: list[str]
+    feature_mean: list[float]
+    feature_std: list[float]
+    target_mean: float
+    target_std: float
+    commands: list[str]
+    future_dt: float
+    waypoint_gap: int
+    min_speed_mps: float
+    max_speed_mps: float
+
+
+class VelocityHeadRuntime:
+    def __init__(self, checkpoint: pathlib.Path, device: str = "cpu"):
+        import torch
+
+        self.torch = torch
+        payload = torch.load(checkpoint, map_location=device)
+        config = payload["model_config"]
+        self.config = VelocityHeadConfig(
+            feature_names=list(config["feature_names"]),
+            feature_mean=[float(x) for x in config["feature_mean"]],
+            feature_std=[float(x) for x in config["feature_std"]],
+            target_mean=float(config["target_mean"]),
+            target_std=float(config["target_std"]),
+            commands=list(config["commands"]),
+            future_dt=float(config["future_dt"]),
+            waypoint_gap=int(config["waypoint_gap"]),
+            min_speed_mps=float(config.get("min_speed_mps", 0.0)),
+            max_speed_mps=float(config.get("max_speed_mps", 8.0)),
+        )
+        self.model = build_mlp(len(self.config.feature_names))
+        self.model.load_state_dict(payload["model_state_dict"])
+        self.model.to(device)
+        self.model.eval()
+        self.device = device
+        self.feature_mean = torch.tensor(self.config.feature_mean, dtype=torch.float32, device=device)
+        self.feature_std = torch.tensor(self.config.feature_std, dtype=torch.float32, device=device).clamp_min(1e-6)
+
+    def predict(
+        self,
+        command: str,
+        current_speed_mps: float,
+        previous_steer: float = 0.0,
+        previous_throttle: float = 0.0,
+        previous_brake: float = 0.0,
+    ) -> float:
+        with self.torch.no_grad():
+            features_np = build_velocity_features(
+                command,
+                current_speed_mps,
+                previous_steer,
+                previous_throttle,
+                previous_brake,
+            )
+            features = self.torch.tensor(features_np, dtype=self.torch.float32, device=self.device)
+            features = (features - self.feature_mean) / self.feature_std
+            pred_norm = self.model(features.unsqueeze(0)).squeeze().item()
+            speed = pred_norm * self.config.target_std + self.config.target_mean
+            return float(np.clip(speed, self.config.min_speed_mps, self.config.max_speed_mps))
+
+
+def build_mlp(input_dim: int):
+    import torch
+
+    return torch.nn.Sequential(
+        torch.nn.Linear(input_dim, 64),
+        torch.nn.ReLU(),
+        torch.nn.Linear(64, 64),
+        torch.nn.ReLU(),
+        torch.nn.Linear(64, 1),
+    )
