@@ -1,12 +1,17 @@
 import torch
 from torch import nn
 from typing import List, Optional
+from pathlib import Path
 from transformers import AutoModel
 
 class LingoInternVLModel(nn.Module):
     def __init__(self, variant, *args, **kwargs):
         super().__init__()
-        self.model = AutoModel.from_pretrained(variant, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(
+            variant,
+            trust_remote_code=True,
+            local_files_only=Path(str(variant)).exists(),
+        )
         try:
             self.num_embeddings = self.model.language_model.model.embed_tokens.num_embeddings
         except:

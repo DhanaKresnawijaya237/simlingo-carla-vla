@@ -62,6 +62,22 @@ DEBUG = False # saves images during evaluation
 HD_VIZ = False
 USE_UKF = True
 
+def resolve_local_hf_variant(variant):
+    """Prefer a local pretrained/<repo-name> checkout over Hugging Face network access."""
+
+    variant = str(variant)
+    repo_root = Path(__file__).resolve().parents[1]
+    pretrained_root = Path(os.environ.get("SIMLINGO_PRETRAINED_ROOT", repo_root / "pretrained"))
+    local_variant = pretrained_root / variant.split("/")[-1]
+    if local_variant.exists():
+        return str(local_variant.resolve())
+    return variant
+
+
+def is_local_hf_variant(variant):
+    return Path(str(variant)).exists()
+
+
 class LingoAgent(autonomous_agent.AutonomousAgent):
     """
         Main class that runs the agents with the run_step function
@@ -150,8 +166,17 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             cfg = OmegaConf.load(file)
         self.cfg = cfg
         self.cfg.model.vision_model.use_global_img = cfg.data_module.use_global_img
-    
-        processor = AutoProcessor.from_pretrained(cfg.model.vision_model.variant, trust_remote_code=True)
+
+        cfg.model.vision_model.variant = resolve_local_hf_variant(cfg.model.vision_model.variant)
+        if hasattr(cfg.model, "language_model") and hasattr(cfg.model.language_model, "variant"):
+            cfg.model.language_model.variant = resolve_local_hf_variant(cfg.model.language_model.variant)
+        print(f"Using vision model files: {cfg.model.vision_model.variant}")
+
+        processor = AutoProcessor.from_pretrained(
+            cfg.model.vision_model.variant,
+            trust_remote_code=True,
+            local_files_only=is_local_hf_variant(cfg.model.vision_model.variant),
+        )
         if 'tokenizer' in processor.__dict__:
                 self.tokenizer = processor.tokenizer
         else:
@@ -159,7 +184,7 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         self.tokenizer.add_special_tokens({'additional_special_tokens': ['<WAYPOINTS>','<WAYPOINTS_DIFF>', '<ORG_WAYPOINTS_DIFF>', '<ORG_WAYPOINTS>', '<WAYPOINT_LAST>', '<ROUTE>', '<ROUTE_DIFF>', '<TARGET_POINT>']})
         self.tokenizer.padding_side = "left"
         # llm_tokenizer = AutoTokenizer.from_pretrained(cfg.model.language_model.variant)
-        cache_dir = f"pretrained/{(cfg.model.vision_model.variant.split('/')[1])}"
+        cache_dir = f"pretrained/{Path(str(cfg.model.vision_model.variant)).name}"
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.bfloat16)
         self.model = hydra.utils.instantiate(
@@ -216,6 +241,7 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         if self.save_path is not None and route_index is not None:
             self.save_path = pathlib.Path(self.save_path) / route_index
             pathlib.Path(self.save_path).mkdir(parents=True, exist_ok=True)
+            self.save_path = str(self.save_path)
 
             self.lon_logger = ScenarioLogger(
                     save_path=self.save_path,
@@ -484,6 +510,31 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
             placeholder_batch_list.append(tmp)
             
             prompt_tp = "Target waypoint: <TARGET_POINT><TARGET_POINT>."
+            if self.config.eval_route_as == 'target_point_command':
+                map_command = {
+                        1: 'go left at the next intersection',
+                        2: 'go right at the next intersection',
+                        3: 'go straight at the next intersection',
+                        4: 'follow the road',
+                        5: 'do a lane change to the left',
+                        6: 'do a lane change to the right',
+                }
+                far_command_value = getattr(far_command, 'value', far_command)
+                next_far_command_value = getattr(next_far_command, 'value', next_far_command)
+                command = map_command.get(far_command_value, 'follow the road')
+                next_command = map_command.get(next_far_command_value, command)
+                if self.last_command in [1, 2, 3] and far_command_value == 4:
+                    next_command = command
+                    command = map_command[self.last_command]
+                if command != next_command:
+                        next_command = f' then {next_command}'
+                else:
+                        next_command = ''
+                dist_to_command = int(np.linalg.norm(ego_target_point))
+                if far_command_value == 4:
+                        prompt_tp = f"{prompt_tp} Command: {command}{next_command}."
+                else:
+                        prompt_tp = f"{prompt_tp} Command: {command} in {dist_to_command} meter{next_command}."
             
         elif self.config.eval_route_as == 'command':
             # get distance from target_point
@@ -583,13 +634,18 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
                         questions.append(conv[i]['content'][0]['text'])
                         conv[i]['content'] = conv[i]['content'][0]['text']
                         
-        cache_dir = f"pretrained/{(self.cfg.model.vision_model.variant.split('/')[1])}"
-        # get absolute path from workspace dir not wokring dir
-        cache_dir = to_absolute_path(cache_dir)
+        if is_local_hf_variant(self.cfg.model.vision_model.variant):
+                cache_dir = str(Path(self.cfg.model.vision_model.variant).resolve())
+        else:
+                cache_dir = f"pretrained/{(self.cfg.model.vision_model.variant.split('/')[1])}"
+                # get absolute path from workspace dir not wokring dir
+                cache_dir = to_absolute_path(cache_dir)
         model_path = f"{cache_dir}/conversation.py"
         if not os.path.exists(model_path):
-                from huggingface_hub import snapshot_download
-                snapshot_download(repo_id=self.cfg.model.vision_model.variant, local_dir=cache_dir)
+                raise FileNotFoundError(
+                        f"Missing conversation.py for local/offline InternVL model at {cache_dir}. "
+                        "Copy the full Hugging Face repo into simlingo/pretrained/<repo-name>."
+                )
                 
         #import from file from model_path
         spec = importlib.util.spec_from_file_location('get_conv_template', model_path)
@@ -598,7 +654,11 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         spec.loader.exec_module(conv_module)
         
         if not hasattr(self, 'tmp_config'):
-                self.tmp_config = AutoConfig.from_pretrained(self.cfg.model.vision_model.variant, trust_remote_code=True)
+                self.tmp_config = AutoConfig.from_pretrained(
+                        self.cfg.model.vision_model.variant,
+                        trust_remote_code=True,
+                        local_files_only=is_local_hf_variant(self.cfg.model.vision_model.variant),
+                )
                 image_size = self.tmp_config.force_image_size or self.tmp_config.vision_config.image_size
                 patch_size = self.tmp_config.vision_config.patch_size
                 
