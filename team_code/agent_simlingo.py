@@ -486,16 +486,22 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         one_hot_command = t_u.command_to_one_hot(self.commands[-2])
         result['command'] = torch.from_numpy(one_hot_command[np.newaxis]).to(self.device, dtype=torch.float32)
 
+        self.target_points = None
+        placeholder_batch_list = []
+        strict_command_only = bool(getattr(self, "task1_strict_command_only", False))
         ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass'])
-        ego_target_point_torch = torch.from_numpy(ego_target_point[np.newaxis]).to(self.device, dtype=torch.float32)
         ego_next_target_point = t_u.inverse_conversion_2d(next_target_point[:2], result['gps'], result['compass'])
+        if strict_command_only:
+            ego_target_point = np.zeros_like(ego_target_point)
+            ego_next_target_point = np.zeros_like(ego_next_target_point)
+        ego_target_point_torch = torch.from_numpy(ego_target_point[np.newaxis]).to(self.device, dtype=torch.float32)
 
         result['target_point'] = ego_target_point_torch
 
-        self.target_points = None
-        placeholder_batch_list = []
+        if strict_command_only:
+            prompt_tp = self.custom_prompt or "Command: follow the road."
 
-        if self.config.eval_route_as == 'target_point' or self.config.eval_route_as == 'target_point_command':
+        elif self.config.eval_route_as == 'target_point' or self.config.eval_route_as == 'target_point_command':
             target_points = [ego_target_point, ego_next_target_point]
             self.target_points = target_points.copy()
             target_points_np = np.array(target_points)
@@ -587,7 +593,7 @@ class LingoAgent(autonomous_agent.AutonomousAgent):
         else:
             prompt = f"Current speed: {speed} m/s. {prompt_tp} Predict the waypoints."
         
-        if self.custom_prompt is not None:
+        if self.custom_prompt is not None and not strict_command_only:
             if self.user_flag == 2 or self.user_flag == 3:
                 prompt = f"Current speed: {speed} m/s. {self.custom_prompt}"
             else:
