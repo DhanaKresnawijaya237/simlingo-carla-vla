@@ -305,6 +305,7 @@ class Task1SimLingoRunner:
             self.RoadOption = FallbackRoadOption
         else:
             self.RoadOption = self.policy.RoadOption
+        self.used_spawn_locations: list[tuple[str, tuple[float, float]]] = []
         self.velocity_head = None
         if args.velocity_head_checkpoint is not None:
             from task_carla_code.task1_velocity_head import VelocityHeadRuntime
@@ -1144,35 +1145,59 @@ class Task1SimLingoRunner:
             indices = [self.args.spawn_index]
 
         last_error = "no candidate checked"
-        for idx in indices[: self.args.max_spawn_candidates]:
-            spawn = spawn_points[idx]
-            wp = self.map.get_waypoint(
-                spawn.location,
-                project_to_road=True,
-                lane_type=self.carla.LaneType.Driving,
-            )
-            if wp is None:
-                last_error = "spawn not on driving lane"
-                continue
-            route_plan, meta = self.build_route(wp, command)
-            if not route_plan:
-                last_error = meta.get("reason", "empty route")
-                continue
-            if command == "straight" and abs(meta.get("route_heading_delta_deg", 0.0)) > self.args.straight_route_max_heading:
-                last_error = f"straight route drifts {meta.get('route_heading_delta_deg')}"
-                continue
-            if command in SPEED_EVAL_COMMANDS and abs(meta.get("route_heading_delta_deg", 0.0)) > self.args.speed_route_max_heading:
-                last_error = f"speed route drifts {meta.get('route_heading_delta_deg')}"
-                continue
-            scenario = {
-                "map": self.map.name,
-                "spawn_index": idx,
-                "command": command,
-                "reason": meta.get("reason", "ok"),
-                **meta,
-            }
-            return spawn, route_plan, scenario
+        requested_min_distance = 0.0 if self.args.spawn_index is not None else float(self.args.min_spawn_distance_m)
+        min_distance_attempts = [requested_min_distance]
+        if requested_min_distance > 0.0 and self.args.relax_spawn_distance:
+            min_distance_attempts.extend([requested_min_distance * 0.75, requested_min_distance * 0.5, 0.0])
+        for min_distance in min_distance_attempts:
+            for idx in indices[: self.args.max_spawn_candidates]:
+                spawn = spawn_points[idx]
+                nearest_used_distance = self.nearest_used_spawn_distance(command, spawn.location)
+                if nearest_used_distance is not None and nearest_used_distance < min_distance:
+                    last_error = f"spawn too close nearest={nearest_used_distance:.2f} < {min_distance:.2f}"
+                    continue
+                wp = self.map.get_waypoint(
+                    spawn.location,
+                    project_to_road=True,
+                    lane_type=self.carla.LaneType.Driving,
+                )
+                if wp is None:
+                    last_error = "spawn not on driving lane"
+                    continue
+                route_plan, meta = self.build_route(wp, command)
+                if not route_plan:
+                    last_error = meta.get("reason", "empty route")
+                    continue
+                if command == "straight" and abs(meta.get("route_heading_delta_deg", 0.0)) > self.args.straight_route_max_heading:
+                    last_error = f"straight route drifts {meta.get('route_heading_delta_deg')}"
+                    continue
+                if command in SPEED_EVAL_COMMANDS and abs(meta.get("route_heading_delta_deg", 0.0)) > self.args.speed_route_max_heading:
+                    last_error = f"speed route drifts {meta.get('route_heading_delta_deg')}"
+                    continue
+                scenario = {
+                    "map": self.map.name,
+                    "spawn_index": idx,
+                    "command": command,
+                    "reason": meta.get("reason", "ok"),
+                    "spawn_min_distance_requested_m": float(requested_min_distance),
+                    "spawn_min_distance_applied_m": float(min_distance),
+                    "spawn_nearest_used_distance_m": None
+                    if nearest_used_distance is None
+                    else float(nearest_used_distance),
+                    "spawn_diversity_scope": self.args.spawn_diversity_scope,
+                    **meta,
+                }
+                self.used_spawn_locations.append((command, (float(spawn.location.x), float(spawn.location.y))))
+                return spawn, route_plan, scenario
         raise RuntimeError(f"Could not select scenario for {command}: {last_error}")
+
+    def nearest_used_spawn_distance(self, command: str, location: Any) -> float | None:
+        distances = []
+        for used_command, (x, y) in self.used_spawn_locations:
+            if self.args.spawn_diversity_scope == "command" and used_command != command:
+                continue
+            distances.append(math.hypot(float(location.x) - x, float(location.y) - y))
+        return min(distances) if distances else None
 
     def build_route(self, start_wp: Any, command: str) -> tuple[list[tuple[Any, Any]], dict[str, Any]]:
         if command in ("turn left", "turn right", "straight"):
@@ -2217,6 +2242,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spawn-index", type=int)
     parser.add_argument("--scenario-seed", type=int, default=0)
     parser.add_argument("--max-spawn-candidates", type=int, default=600)
+    parser.add_argument(
+        "--min-spawn-distance-m",
+        type=float,
+        default=35.0,
+        help="Prefer accepted trial spawns at least this far from previous accepted spawns.",
+    )
+    parser.add_argument(
+        "--spawn-diversity-scope",
+        choices=("command", "global"),
+        default="command",
+        help="'command' spaces trials within each command; 'global' spaces all commands from each other.",
+    )
+    parser.add_argument("--relax-spawn-distance", action="store_true", default=True)
+    parser.add_argument("--no-relax-spawn-distance", dest="relax_spawn_distance", action="store_false")
     parser.add_argument("--vehicle-filter", default="vehicle.tesla.model3")
     parser.add_argument("--route-step-m", type=float, default=2.0)
     parser.add_argument("--turn-route-length-m", type=float, default=140.0)
