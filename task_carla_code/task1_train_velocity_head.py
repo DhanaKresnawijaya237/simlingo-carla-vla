@@ -25,7 +25,57 @@ from task_carla_code.task1_velocity_head import (
 )
 
 
-def build_examples(annotation_path: pathlib.Path, future_dt: float, waypoint_gap: int) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+def semantic_target_speed(sample: dict[str, Any], args: argparse.Namespace) -> float | None:
+    command = str(sample.get("command", "")).strip().lower()
+    if command == "stop":
+        return float(args.stop_target_speed_mps)
+    if command == "slow down":
+        return float(args.slowdown_target_speed_mps)
+    if command == "speed up":
+        return float(args.speedup_target_speed_mps)
+    return target_speed_from_annotation(sample, future_dt=args.future_dt, waypoint_gap=args.waypoint_gap)
+
+
+def sample_speed_mps(sample: dict[str, Any]) -> float:
+    ego_state = sample.get("ego_state")
+    if isinstance(ego_state, dict) and "speed_mps" in ego_state:
+        return float(ego_state["speed_mps"])
+    context = sample.get("context_features")
+    if isinstance(context, dict):
+        names = context.get("names") or []
+        values = context.get("values") or []
+        if "speed_mps" in names:
+            idx = names.index("speed_mps")
+            if idx < len(values):
+                return float(values[idx])
+    return 0.0
+
+
+def relative_semantic_target_speed(sample: dict[str, Any], args: argparse.Namespace) -> float | None:
+    command = str(sample.get("command", "")).strip().lower()
+    current_speed = sample_speed_mps(sample)
+    if command == "stop":
+        return float(args.stop_target_speed_mps)
+    if command == "slow down":
+        return float(
+            np.clip(
+                current_speed - float(args.slowdown_delta_mps),
+                float(args.relative_slowdown_min_speed_mps),
+                float(args.max_speed_mps),
+            )
+        )
+    if command == "speed up":
+        return float(
+            np.clip(
+                current_speed + float(args.speedup_delta_mps),
+                float(args.min_speed_mps),
+                float(args.relative_speedup_max_speed_mps),
+            )
+        )
+    return target_speed_from_annotation(sample, future_dt=args.future_dt, waypoint_gap=args.waypoint_gap)
+
+
+def build_examples(annotation_path: pathlib.Path, args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
     annotations = load_annotations(annotation_path)
     features: list[np.ndarray] = []
     targets: list[float] = []
@@ -34,7 +84,12 @@ def build_examples(annotation_path: pathlib.Path, future_dt: float, waypoint_gap
     for sample in annotations.values():
         try:
             command = str(sample.get("command", "")).strip().lower()
-            target = target_speed_from_annotation(sample, future_dt=future_dt, waypoint_gap=waypoint_gap)
+            if args.label_mode == "semantic":
+                target = semantic_target_speed(sample, args)
+            elif args.label_mode == "relative-semantic":
+                target = relative_semantic_target_speed(sample, args)
+            else:
+                target = target_speed_from_annotation(sample, future_dt=args.future_dt, waypoint_gap=args.waypoint_gap)
             if command not in counts or target is None:
                 skipped += 1
                 continue
@@ -76,6 +131,14 @@ def main() -> int:
     parser.add_argument("--val-split", default="val")
     parser.add_argument("--future-dt", type=float, default=0.4)
     parser.add_argument("--waypoint-gap", type=int, default=2)
+    parser.add_argument("--label-mode", choices=("semantic", "relative-semantic", "trajectory"), default="semantic")
+    parser.add_argument("--stop-target-speed-mps", type=float, default=0.0)
+    parser.add_argument("--slowdown-target-speed-mps", type=float, default=1.5)
+    parser.add_argument("--speedup-target-speed-mps", type=float, default=6.0)
+    parser.add_argument("--slowdown-delta-mps", type=float, default=1.5)
+    parser.add_argument("--speedup-delta-mps", type=float, default=1.2)
+    parser.add_argument("--relative-slowdown-min-speed-mps", type=float, default=1.0)
+    parser.add_argument("--relative-speedup-max-speed-mps", type=float, default=7.0)
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -95,8 +158,8 @@ def main() -> int:
 
     train_path = split_annotation_path(args.data_root, args.train_split)
     val_path = split_annotation_path(args.data_root, args.val_split)
-    train_x, train_y, train_counts = build_examples(train_path, args.future_dt, args.waypoint_gap)
-    val_x, val_y, val_counts = build_examples(val_path, args.future_dt, args.waypoint_gap)
+    train_x, train_y, train_counts = build_examples(train_path, args)
+    val_x, val_y, val_counts = build_examples(val_path, args)
 
     feature_mean = train_x.mean(axis=0)
     feature_std = train_x.std(axis=0)
@@ -167,6 +230,14 @@ def main() -> int:
                         "commands": list(BASIC_COMMANDS),
                         "future_dt": float(args.future_dt),
                         "waypoint_gap": int(args.waypoint_gap),
+                        "label_mode": args.label_mode,
+                        "stop_target_speed_mps": float(args.stop_target_speed_mps),
+                        "slowdown_target_speed_mps": float(args.slowdown_target_speed_mps),
+                        "speedup_target_speed_mps": float(args.speedup_target_speed_mps),
+                        "slowdown_delta_mps": float(args.slowdown_delta_mps),
+                        "speedup_delta_mps": float(args.speedup_delta_mps),
+                        "relative_slowdown_min_speed_mps": float(args.relative_slowdown_min_speed_mps),
+                        "relative_speedup_max_speed_mps": float(args.relative_speedup_max_speed_mps),
                         "min_speed_mps": float(args.min_speed_mps),
                         "max_speed_mps": float(args.max_speed_mps),
                     },
@@ -191,6 +262,14 @@ def main() -> int:
         "train_counts": train_counts,
         "val_counts": val_counts,
         "feature_names": list(FEATURE_NAMES),
+        "label_mode": args.label_mode,
+        "stop_target_speed_mps": float(args.stop_target_speed_mps),
+        "slowdown_target_speed_mps": float(args.slowdown_target_speed_mps),
+        "speedup_target_speed_mps": float(args.speedup_target_speed_mps),
+        "slowdown_delta_mps": float(args.slowdown_delta_mps),
+        "speedup_delta_mps": float(args.speedup_delta_mps),
+        "relative_slowdown_min_speed_mps": float(args.relative_slowdown_min_speed_mps),
+        "relative_speedup_max_speed_mps": float(args.relative_speedup_max_speed_mps),
         "target_mean_mps": target_mean,
         "target_std_mps": target_std,
         "best_epoch": best_epoch,

@@ -11,6 +11,8 @@ import os
 import pathlib
 import queue
 import random
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -330,7 +332,14 @@ class Task1SimLingoRunner:
         self.write_eval_summary(results)
         return 0 if all(r.success for r in results) else 1
 
-    def predict_velocity_head_speed(self, command: str, vehicle: Any, previous_control: Any | None) -> float | None:
+    def predict_velocity_head_speed(
+        self,
+        command: str,
+        vehicle: Any,
+        previous_control: Any | None,
+        baseline_speed_mps: float | None = None,
+        command_elapsed_sec: float = 0.0,
+    ) -> float | None:
         if self.velocity_head is None:
             return None
         previous_steer = float(previous_control.steer) if previous_control is not None else 0.0
@@ -342,6 +351,8 @@ class Task1SimLingoRunner:
             previous_steer=previous_steer,
             previous_throttle=previous_throttle,
             previous_brake=previous_brake,
+            baseline_speed_mps=baseline_speed_mps,
+            command_elapsed_sec=command_elapsed_sec,
         )
 
     def run_trial(self, command: str, trial_index: int) -> TrialResult:
@@ -358,6 +369,7 @@ class Task1SimLingoRunner:
         frames_for_video: list[np.ndarray] = []
         image_queue: queue.Queue[Any] = queue.Queue()
         video_queue: queue.Queue[Any] = queue.Queue()
+        video_written = False
 
         try:
             self.apply_sync_settings()
@@ -427,13 +439,23 @@ class Task1SimLingoRunner:
             command_start_step = int(round(warmup_sec * self.args.sim_fps))
 
             total_steps = int(round(self.args.duration * self.args.sim_fps))
-            policy_interval = max(1, int(round(self.args.sim_fps / max(0.1, float(self.args.policy_hz)))))
+            simlingo_policy_hz = float(self.args.policy_hz)
+            policy_interval = max(1, int(round(self.args.sim_fps / max(0.1, simlingo_policy_hz))))
+            velocity_head_interval = max(1, int(round(self.args.sim_fps / max(0.1, float(self.args.velocity_head_hz)))))
+            velocity_head_commands = set(parse_command_sequence(self.args.velocity_head_commands))
             control = self.carla.VehicleControl(steer=0.0, throttle=0.0, brake=1.0)
             previous_control = None
             policy_latency_sec = 0.0
             fresh_policy = False
             policy_calls = 0
-            cached_world_route = np.zeros((0, 2), dtype=np.float32)
+            velocity_head_calls = 0
+            velocity_head_fresh = False
+            map_world_route = route_plan_to_world_points(route_plan)
+            cached_world_route = (
+                map_world_route.copy()
+                if command in SPEED_EVAL_COMMANDS and self.args.speed_command_route_source == "map"
+                else np.zeros((0, 2), dtype=np.float32)
+            )
             cached_route_created_step: int | None = None
             cached_model_target_speed_mps: float | None = None
             velocity_head_target_speed_mps: float | None = None
@@ -461,6 +483,11 @@ class Task1SimLingoRunner:
                     )
                     self.policy.set_active_command(active_command)
                     fresh_policy = step == 0 or command_just_started or route_exhausted_refresh or (step % policy_interval == 0)
+                    velocity_head_fresh = bool(
+                        self.velocity_head is not None
+                        and execution_command in velocity_head_commands
+                        and (step == 0 or command_just_started or step % velocity_head_interval == 0)
+                    )
                     if fresh_policy:
                         policy_calls += 1
                         input_data = self.build_input_data(vehicle, rgb_image)
@@ -478,7 +505,11 @@ class Task1SimLingoRunner:
                         cached_model_target_speed_mps = estimate_model_target_speed_mps(
                             diag_after_policy.get("predicted_speed_waypoints")
                         )
-                        if predicted_route.size > 0:
+                        use_model_route = not (
+                            command in SPEED_EVAL_COMMANDS
+                            and self.args.speed_command_route_source == "map"
+                        )
+                        if predicted_route.size > 0 and use_model_route:
                             route_transform = vehicle.get_transform()
                             old_local_route = world_route_to_local(cached_world_route, route_transform)
                             predicted_route_diag = route_lateral_diagnostics(predicted_route)
@@ -510,6 +541,14 @@ class Task1SimLingoRunner:
                                 if old_local_route.size
                                 else 0,
                             }
+                        elif predicted_route.size > 0:
+                            cached_route_update_diag = {
+                                "route_source": "map",
+                                "model_route_ignored_for_speed_command": True,
+                                "model_target_speed_mps": cached_model_target_speed_mps,
+                                "new_route_lateral_diag": route_lateral_diagnostics(predicted_route),
+                                "map_route_points": int(len(map_world_route)),
+                            }
                         if self.args.progress:
                             print(
                                 f"[{command} #{trial_index}] policy_call={policy_calls} "
@@ -519,11 +558,39 @@ class Task1SimLingoRunner:
                                 flush=True,
                             )
                     if self.args.simlingo_execution_mode == "cached-route-follower":
-                        velocity_head_target_speed_mps = self.predict_velocity_head_speed(
-                            command=execution_command,
-                            vehicle=vehicle,
-                            previous_control=previous_control,
-                        )
+                        if velocity_head_fresh:
+                            velocity_head_calls += 1
+                            baseline_count = max(
+                                1,
+                                int(round(float(self.args.speed_baseline_window_sec) * float(self.args.sim_fps))),
+                            )
+                            baseline_window = baseline_speeds[-baseline_count:] if baseline_speeds else []
+                            velocity_baseline_speed_mps = (
+                                float(sum(baseline_window) / len(baseline_window))
+                                if baseline_window
+                                else speed_mps(vehicle)
+                            )
+                            # The stop label is absolute zero speed. Feeding the warmup
+                            # baseline after the vehicle has already slowed is out of
+                            # distribution for the current velocity-head training data and
+                            # can make the head drift back toward a moving target.
+                            head_baseline_speed_mps = (
+                                speed_mps(vehicle)
+                                if execution_command == "stop"
+                                else velocity_baseline_speed_mps
+                            )
+                            # v7 semantic velocity-head training annotations do not carry
+                            # real command elapsed time, so this feature was constant zero
+                            # during training. Keep runtime in-distribution until we collect
+                            # elapsed-aware labels.
+                            velocity_command_elapsed_sec = 0.0
+                            velocity_head_target_speed_mps = self.predict_velocity_head_speed(
+                                command=execution_command,
+                                vehicle=vehicle,
+                                previous_control=previous_control,
+                                baseline_speed_mps=head_baseline_speed_mps,
+                                command_elapsed_sec=velocity_command_elapsed_sec,
+                            )
                         control, cached_follow_diag = follow_cached_route(
                             vehicle,
                             cached_world_route,
@@ -549,10 +616,6 @@ class Task1SimLingoRunner:
                     if self.args.simlingo_execution_mode == "cached-route-follower":
                         diag["cached_follow_route"] = cached_follow_diag.get("cached_local_route", [])
                         diag["cached_target_point"] = cached_follow_diag.get("cached_target_point")
-                    if self.args.overlay_predictions:
-                        draw_prediction_overlay(frame, diag, self.args)
-                    if step % max(1, int(round(self.args.sim_fps / self.args.fps))) == 0:
-                        frames_for_video.append(frame)
 
                     speed = speed_mps(vehicle)
                     speeds.append(speed)
@@ -570,7 +633,20 @@ class Task1SimLingoRunner:
                         scenario,
                         start_yaw,
                         transform.rotation.yaw,
+                        start_location,
                     )
+                    diag["target_road_reached"] = bool(target_road_status.get("reached"))
+                    diag["target_road_reason"] = target_road_status.get("reason")
+                    diag["command"] = command
+                    diag["speed_mps"] = float(speed)
+                    diag["ego_location"] = location_dict(transform.location)
+                    diag["ego_heading_deg"] = float(transform.rotation.yaw)
+                    diag["target_road_point"] = scenario.get("target_road_point")
+                    diag["target_road_heading_deg"] = scenario.get("target_road_heading_deg")
+                    if self.args.overlay_predictions:
+                        draw_prediction_overlay(frame, diag, self.args)
+                    if step % max(1, int(round(self.args.sim_fps / self.args.fps))) == 0:
+                        frames_for_video.append(frame)
                     target_road_reached = target_road_status["reached"]
                     status = self.evaluate_instant_status(
                         command=command,
@@ -583,17 +659,23 @@ class Task1SimLingoRunner:
                         offroad_frames=offroad_frames,
                         collision_count=len(collision_events),
                     )
-                    turn_command = command in ("turn left", "turn right")
-                    turn_safety_ok = (
+                    target_road_command = command in ("turn left", "turn right") or (
+                        command == "straight" and self.args.straight_require_junction
+                    )
+                    route_safety_ok = (
                         len(collision_events) <= self.args.max_collision_events
                         and (self.args.allow_offroad_success or offroad_frames <= self.args.max_offroad_frames)
                     )
-                    completion_met = bool(target_road_reached and turn_safety_ok) if turn_command else bool(status["condition_met"])
+                    completion_met = (
+                        bool(target_road_reached and route_safety_ok)
+                        if target_road_command
+                        else bool(status["condition_met"])
+                    )
                     if completion_met:
                         success_hold += 1
                         if success_hold >= min_required_hold and reached_success_step is None:
                             reached_success_step = step
-                            termination_reason = "target_road_held" if turn_command else "success_condition"
+                            termination_reason = "target_road_held" if target_road_command else "success_condition"
                     else:
                         success_hold = 0
 
@@ -639,7 +721,13 @@ class Task1SimLingoRunner:
                         "target_points": diag.get("target_points"),
                         "route_command_history": diag.get("route_command_history"),
                         "fresh_policy": bool(fresh_policy),
+                        "policy_hz": float(simlingo_policy_hz),
                         "policy_interval_steps": int(policy_interval),
+                        "velocity_head_fresh": bool(velocity_head_fresh),
+                        "velocity_head_hz": float(self.args.velocity_head_hz),
+                        "velocity_head_interval_steps": int(velocity_head_interval),
+                        "velocity_head_calls": int(velocity_head_calls),
+                        "velocity_head_commands": sorted(velocity_head_commands),
                         "policy_latency_sec": float(policy_latency_sec if fresh_policy else 0.0),
                         "prime_policy_calls": int(prime_policy_calls),
                         "prime_policy_latency_sec": float(prime_policy_latency_sec),
@@ -657,6 +745,8 @@ class Task1SimLingoRunner:
                         "target_road_distance_m": target_road_status.get("distance_m"),
                         "target_road_heading_error_deg": target_road_status.get("heading_error_deg"),
                         "target_road_lane_center_distance_m": target_road_status.get("lane_center_distance_m"),
+                        "straight_branch_progress_m": target_road_status.get("straight_branch_progress_m"),
+                        "straight_branch_lateral_m": target_road_status.get("straight_branch_lateral_m"),
                         "target_road_same_road": target_road_status.get("same_road"),
                         "target_road_reached": bool(target_road_reached),
                         "target_road_reason": target_road_status.get("reason"),
@@ -672,13 +762,14 @@ class Task1SimLingoRunner:
                     ticks_file.write(json.dumps(tick) + "\n")
                     ticks_file.flush()
 
-                    if self.args.stop_on_offroad and offroad:
+                    if self.args.stop_on_offroad and offroad_frames > self.args.max_offroad_frames:
                         termination_reason = "offroad"
                         break
                     if self.args.stop_on_success and reached_success_step is not None:
                         break
 
             write_video(video_path, frames_for_video, self.args.fps)
+            video_written = True
             result = self.build_result(
                 command=command,
                 trial_index=trial_index,
@@ -704,6 +795,9 @@ class Task1SimLingoRunner:
                         "checkpoint": str(self.args.checkpoint),
                         "model_input_mode": self.args.simlingo_input_mode,
                         "execution_mode": self.args.simlingo_execution_mode,
+                        "policy_hz": self.args.policy_hz,
+                        "velocity_head_hz": self.args.velocity_head_hz,
+                        "velocity_head_commands": self.args.velocity_head_commands,
                         "route_tensors_in_model_input": self.args.simlingo_input_mode != "strict-command",
                         "controller_inference_mode": self.args.simlingo_controller_inference_mode,
                         "speed_control_mode": self.args.simlingo_speed_control_mode,
@@ -734,10 +828,11 @@ class Task1SimLingoRunner:
             print(f"[{command} #{trial_index}] success={result.success} reason={result.reason}", flush=True)
             return result
         finally:
-            try:
-                write_video(video_path, frames_for_video, self.args.fps)
-            except Exception:
-                pass
+            if not video_written:
+                try:
+                    write_video(video_path, frames_for_video, self.args.fps)
+                except Exception:
+                    pass
             for actor in reversed(actors):
                 try:
                     if hasattr(actor, "stop"):
@@ -795,13 +890,17 @@ class Task1SimLingoRunner:
             offroad_frames=offroad_frames,
             collision_count=len(collision_events),
         )
-        if command in ("turn left", "turn right"):
+        target_road_command = command in ("turn left", "turn right") or (
+            command == "straight" and self.args.straight_require_junction
+        )
+        if target_road_command:
             target_status = self.target_road_status(
                 command,
                 vehicle,
                 scenario,
                 start_yaw,
                 transform.rotation.yaw,
+                start_location,
             )
             success = bool(reached_success_step is not None)
             reason = "ok" if success else str(target_status["reason"])
@@ -941,13 +1040,19 @@ class Task1SimLingoRunner:
         scenario: dict[str, Any],
         start_yaw: float,
         current_yaw: float,
+        start_location: Any,
     ) -> dict[str, Any]:
         status = {
             "reached": False,
             "same_road": False,
             "distance_m": None,
+            "heading_delta_deg": None,
             "heading_error_deg": None,
+            "heading_axis_error_deg": None,
             "lane_center_distance_m": None,
+            "distance_from_start_m": None,
+            "straight_branch_progress_m": None,
+            "straight_branch_lateral_m": None,
             "body_on_target_road": False,
             "body_target_road_samples": 0,
             "body_total_samples": 0,
@@ -955,8 +1060,8 @@ class Task1SimLingoRunner:
             "body_samples": [],
             "reason": "not_checked",
         }
-        if command not in ("turn left", "turn right"):
-            status["reason"] = "not_turn_command"
+        if command not in ("turn left", "turn right", "straight"):
+            status["reason"] = "not_target_road_command"
             return status
         target_road_id = scenario.get("target_road_id")
         if target_road_id is None:
@@ -964,6 +1069,7 @@ class Task1SimLingoRunner:
             return status
         transform = vehicle.get_transform()
         location = transform.location
+        status["distance_from_start_m"] = float(distance_2d(start_location, location))
         lane_wp = self.map.get_waypoint(
             location,
             project_to_road=False,
@@ -973,19 +1079,13 @@ class Task1SimLingoRunner:
             status["reason"] = "center_not_on_driving_lane"
             return status
         heading_delta = angle_delta_deg(start_yaw, current_yaw)
-        if command == "turn right" and heading_delta < self.args.target_road_min_heading_deg:
-            status["reason"] = f"right_heading_delta_too_small={heading_delta:.2f}"
-            return status
-        if command == "turn left" and heading_delta > -self.args.target_road_min_heading_deg:
-            status["reason"] = f"left_heading_delta_too_small={heading_delta:.2f}"
-            return status
-        if abs(heading_delta) < self.args.target_road_min_heading_deg:
-            status["reason"] = f"heading_delta_too_small={heading_delta:.2f}"
-            return status
+        status["heading_delta_deg"] = float(heading_delta)
 
         same_road = int(lane_wp.road_id) == int(target_road_id)
         status["same_road"] = bool(same_road)
-        status["heading_error_deg"] = float(abs(angle_delta_deg(lane_wp.transform.rotation.yaw, current_yaw)))
+        directed_heading_error = float(abs(angle_delta_deg(lane_wp.transform.rotation.yaw, current_yaw)))
+        status["heading_error_deg"] = directed_heading_error
+        status["heading_axis_error_deg"] = float(min(directed_heading_error, abs(180.0 - directed_heading_error)))
         status["lane_center_distance_m"] = float(distance_2d(lane_wp.transform.location, location))
 
         target_point = scenario.get("target_road_point") or {}
@@ -994,8 +1094,43 @@ class Task1SimLingoRunner:
             dy = float(location.y) - float(target_point["y"])
             status["distance_m"] = float((dx * dx + dy * dy) ** 0.5)
 
-        if status["heading_error_deg"] is None or status["heading_error_deg"] > self.args.target_road_max_heading_error_deg:
-            status["reason"] = f"heading_error={status['heading_error_deg']}"
+        branch_point = scenario.get("branch_point") or {}
+        if command == "straight" and {"x", "y"}.issubset(branch_point):
+            road_heading = scenario.get("target_road_heading_deg")
+            if road_heading is None:
+                road_heading = lane_wp.transform.rotation.yaw
+            heading_rad = math.radians(float(road_heading))
+            dx = float(location.x) - float(branch_point["x"])
+            dy = float(location.y) - float(branch_point["y"])
+            forward_x = math.cos(heading_rad)
+            forward_y = math.sin(heading_rad)
+            right_x = -math.sin(heading_rad)
+            right_y = math.cos(heading_rad)
+            status["straight_branch_progress_m"] = float(dx * forward_x + dy * forward_y)
+            status["straight_branch_lateral_m"] = float(abs(dx * right_x + dy * right_y))
+
+        turn_heading_ok = True
+        if command == "turn right":
+            turn_heading_ok = heading_delta >= self.args.target_road_min_heading_deg
+        elif command == "turn left":
+            turn_heading_ok = heading_delta <= -self.args.target_road_min_heading_deg
+        near_selected_target = (
+            status["distance_m"] is not None
+            and status["distance_m"] <= self.args.target_road_reach_distance_m
+        )
+        if command in ("turn left", "turn right") and not turn_heading_ok and not near_selected_target:
+            direction = "right" if command == "turn right" else "left"
+            status["reason"] = f"{direction}_heading_delta_too_small={heading_delta:.2f}"
+            return status
+
+        if (
+            status["heading_axis_error_deg"] is None
+            or status["heading_axis_error_deg"] > self.args.target_road_max_heading_error_deg
+        ):
+            status["reason"] = (
+                f"heading_axis_error={status['heading_axis_error_deg']} "
+                f"directed_heading_error={status['heading_error_deg']}"
+            )
             return status
         if (
             status["lane_center_distance_m"] is None
@@ -1003,28 +1138,53 @@ class Task1SimLingoRunner:
         ):
             status["reason"] = f"lane_center_distance={status['lane_center_distance_m']}"
             return status
-        body_status = (
-            self.vehicle_body_on_target_road(vehicle, int(target_road_id))
-            if same_road
-            else self.vehicle_body_on_driving_lane(vehicle)
-        )
+        if command == "straight":
+            body_status = self.vehicle_body_on_driving_lane(vehicle)
+        else:
+            body_status = (
+                self.vehicle_body_on_target_road(vehicle, int(target_road_id))
+                if same_road
+                else self.vehicle_body_on_driving_lane(vehicle)
+            )
         status.update(body_status)
         if not status["body_on_target_road"]:
+            body_reason = "body_not_on_target_road" if same_road else "body_not_on_driving_lane"
+            status["reason"] = f"{body_reason} {status['body_target_road_samples']}/{status['body_total_samples']}"
+            return status
+
+        if command == "straight" and status["distance_from_start_m"] < self.args.straight_target_min_distance_m:
             status["reason"] = (
-                f"body_not_on_driving_lane "
-                f"{status['body_target_road_samples']}/{status['body_total_samples']}"
+                f"straight_distance_from_start={status['distance_from_start_m']:.2f} "
+                f"< {self.args.straight_target_min_distance_m:.2f}"
+            )
+            return status
+        if (
+            command == "straight"
+            and status["straight_branch_progress_m"] is not None
+            and status["straight_branch_progress_m"] < self.args.straight_post_junction_min_distance_m
+        ):
+            status["reason"] = (
+                f"straight_branch_progress={status['straight_branch_progress_m']:.2f} "
+                f"< {self.args.straight_post_junction_min_distance_m:.2f}"
             )
             return status
 
-        if (
-            self.args.target_road_require_distance
-            and (status["distance_m"] is None or status["distance_m"] > self.args.target_road_reach_distance_m)
+        require_target_distance = self.args.target_road_require_distance
+        if require_target_distance and (
+            status["distance_m"] is None or status["distance_m"] > self.args.target_road_reach_distance_m
         ):
             status["reason"] = f"target_distance={status['distance_m']}"
             return status
 
         status["reached"] = True
-        status["reason"] = "ok" if same_road else f"ok_aligned_on_driving_lane center_road={lane_wp.road_id} target_road={target_road_id}"
+        if command == "straight":
+            status["reason"] = (
+                f"ok_straight_aligned_on_driving_lane "
+                f"center_road={lane_wp.road_id} target_road={target_road_id} "
+                f"distance_from_start={status['distance_from_start_m']:.2f}"
+            )
+        else:
+            status["reason"] = "ok" if same_road else f"ok_aligned_on_driving_lane center_road={lane_wp.road_id} target_road={target_road_id}"
         return status
 
     def vehicle_body_on_target_road(self, vehicle: Any, target_road_id: int) -> dict[str, Any]:
@@ -1168,6 +1328,23 @@ class Task1SimLingoRunner:
                 if not route_plan:
                     last_error = meta.get("reason", "empty route")
                     continue
+                if command in ("turn left", "turn right", "straight") and wp.is_junction:
+                    last_error = "spawn starts inside junction"
+                    continue
+                if command in ("turn left", "turn right", "straight"):
+                    branch_index = meta.get("branch_index")
+                    if branch_index is None:
+                        last_error = "missing junction branch index"
+                        continue
+                    if int(branch_index) < self.args.min_pre_junction_route_points:
+                        last_error = (
+                            f"junction branch too close branch_index={branch_index} "
+                            f"< {self.args.min_pre_junction_route_points}"
+                        )
+                        continue
+                if command == "straight" and self.args.straight_require_junction and not meta.get("branch_committed", False):
+                    last_error = "straight route is not an intersection straight branch"
+                    continue
                 if command == "straight" and abs(meta.get("route_heading_delta_deg", 0.0)) > self.args.straight_route_max_heading:
                     last_error = f"straight route drifts {meta.get('route_heading_delta_deg')}"
                     continue
@@ -1270,10 +1447,17 @@ class Task1SimLingoRunner:
         target_road_point = None
         target_road_heading_deg = None
         target_road_route_index = None
+        branch_point = None
         if branch_index is not None and route:
+            branch_point = location_dict(route[branch_index][0].location)
+            target_depth_m = (
+                float(self.args.straight_target_depth_m)
+                if command == "straight"
+                else float(self.args.target_road_depth_m)
+            )
             target_idx = min(
                 len(route) - 1,
-                branch_index + max(8, int(round(self.args.target_road_depth_m / self.args.route_step_m))),
+                branch_index + max(8, int(round(target_depth_m / self.args.route_step_m))),
             )
             target_road_route_index = int(target_idx)
             target_loc = route[target_idx][0].location
@@ -1290,10 +1474,12 @@ class Task1SimLingoRunner:
         return route, {
             "reason": "junction route" if branch_committed else "straight continuation route",
             "branch_committed": branch_committed,
+            "branch_index": branch_index,
+            "branch_point": branch_point,
             "branch_delta_deg": float(chosen_delta),
             "route_heading_delta_deg": float(heading_delta),
             "route_points": len(route),
-            "target_road_depth_m": float(self.args.target_road_depth_m),
+            "target_road_depth_m": target_depth_m if branch_index is not None else None,
             "target_road_route_index": target_road_route_index,
             "target_road_id": target_road_id,
             "target_lane_id": target_lane_id,
@@ -1552,6 +1738,13 @@ def normalize_command(command: str) -> str:
     return normalized
 
 
+def parse_command_sequence(raw: str) -> list[str]:
+    commands = [normalize_command(part) for part in raw.split(",") if part.strip()]
+    if not commands:
+        raise ValueError("Expected at least one command.")
+    return commands
+
+
 def command_prompt(command: str | None) -> str | None:
     if command == "turn left":
         return "Command: turn left at the next intersection."
@@ -1649,6 +1842,14 @@ def blend_local_routes(old_local: np.ndarray, new_local: np.ndarray, new_weight:
     weight = float(np.clip(new_weight, 0.0, 1.0))
     blended[:count] = (1.0 - weight) * old_ahead[:count] + weight * new_local[:count]
     return blended.astype(np.float32)
+
+
+def route_plan_to_world_points(route_plan: list[tuple[Any, Any]]) -> np.ndarray:
+    points = []
+    for transform, _option in route_plan:
+        location = transform.location
+        points.append([float(location.x), float(location.y)])
+    return np.asarray(points, dtype=np.float32) if points else np.zeros((0, 2), dtype=np.float32)
 
 
 def world_route_to_local(points: np.ndarray, transform: Any) -> np.ndarray:
@@ -1752,7 +1953,10 @@ def follow_cached_route(
     if velocity_head_target_speed_mps is not None:
         target_speed = float(np.clip(velocity_head_target_speed_mps, args.velocity_head_min_speed_mps, args.velocity_head_max_speed_mps))
         speed_source = "velocity_head"
-    elif args.simlingo_speed_control_mode == "model" and model_target_speed_mps is not None:
+    elif (
+        args.simlingo_speed_control_mode == "model"
+        or (args.simlingo_speed_control_mode == "model-speed-commands" and command in SPEED_EVAL_COMMANDS)
+    ) and model_target_speed_mps is not None:
         target_speed = float(np.clip(model_target_speed_mps, 0.0, args.cached_route_fast_speed_mps))
         speed_source = "model"
     elif command == "stop":
@@ -1771,7 +1975,19 @@ def follow_cached_route(
         throttle = 0.0
         brake = float(np.clip((speed - target_speed) * args.cached_route_brake_gain, 0.0, args.cached_route_max_brake))
     else:
-        throttle = float(np.clip(error * args.cached_route_throttle_gain, 0.0, args.cached_route_max_throttle))
+        if error <= float(args.cached_route_throttle_deadband_mps):
+            throttle = 0.0
+        else:
+            throttle_feedforward = float(args.cached_route_throttle_feedforward) + (
+                float(args.cached_route_speed_throttle_feedforward_gain) * max(0.0, target_speed)
+            )
+            throttle = float(
+                np.clip(
+                    throttle_feedforward + error * args.cached_route_throttle_gain,
+                    0.0,
+                    args.cached_route_max_throttle,
+                )
+            )
         brake = 0.0
 
     return carla_module.VehicleControl(steer=steer, throttle=throttle, brake=brake), {
@@ -1783,6 +1999,8 @@ def follow_cached_route(
         "cached_model_target_speed_mps": model_target_speed_mps,
         "cached_velocity_head_target_speed_mps": velocity_head_target_speed_mps,
         "cached_speed_source": speed_source,
+        "cached_speed_error_mps": error,
+        "cached_throttle_feedforward": throttle_feedforward if "throttle_feedforward" in locals() else 0.0,
         "cached_reason": "ok",
     }
 
@@ -1842,6 +2060,7 @@ def draw_prediction_overlay(frame: np.ndarray, diag: dict[str, Any], args: argpa
     route = extract(diag.get("predicted_route"))
     speed_route = extract(diag.get("predicted_speed_waypoints"))
     cached_route = extract(diag.get("cached_follow_route"))
+    command = str(diag.get("command") or "")
 
     cv2.circle(frame, (width // 2, height // 2), 5, (255, 255, 255), -1)
     cv2.putText(frame, "ego", (width // 2 + 8, height // 2 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
@@ -1864,6 +2083,93 @@ def draw_prediction_overlay(frame: np.ndarray, diag: dict[str, Any], args: argpa
     cv2.putText(frame, "green: predicted speed wps", (16, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
     cv2.putText(frame, "cyan: cached follow path", (16, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
+    if command in ("stop", "speed up", "slow down"):
+        speed = float(diag.get("speed_mps") or 0.0)
+        target_speed = None
+        cached_follow = diag.get("cached_follow")
+        if isinstance(cached_follow, dict):
+            raw_target = cached_follow.get("cached_target_speed_mps")
+            if raw_target is not None:
+                try:
+                    target_speed = float(raw_target)
+                except (TypeError, ValueError):
+                    target_speed = None
+        box_w = 230
+        box_h = 72 if target_speed is not None else 50
+        x0 = max(8, width - box_w - 10)
+        y0 = 10
+        cv2.rectangle(frame, (x0, y0), (x0 + box_w, y0 + box_h), (0, 0, 0), -1)
+        cv2.rectangle(frame, (x0, y0), (x0 + box_w, y0 + box_h), (255, 255, 255), 1)
+        cv2.putText(
+            frame,
+            f"speed {speed:.2f} m/s",
+            (x0 + 12, y0 + 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        if target_speed is not None:
+            cv2.putText(
+                frame,
+                f"target {target_speed:.2f} m/s",
+                (x0 + 12, y0 + 58),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.54,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+
+def target_road_polygon_pixels(
+    diag: dict[str, Any],
+    ppm: float,
+    width: int,
+    height: int,
+    args: argparse.Namespace,
+) -> np.ndarray | None:
+    target_point = diag.get("target_road_point")
+    ego_location = diag.get("ego_location")
+    target_heading = diag.get("target_road_heading_deg")
+    ego_heading = diag.get("ego_heading_deg")
+    if not isinstance(target_point, dict) or not isinstance(ego_location, dict):
+        return None
+    if target_heading is None or ego_heading is None:
+        return None
+    try:
+        target_xy = np.asarray([float(target_point["x"]), float(target_point["y"])], dtype=np.float32)
+        ego_xy = np.asarray([float(ego_location["x"]), float(ego_location["y"])], dtype=np.float32)
+        ego_yaw = math.radians(float(ego_heading))
+        road_yaw = math.radians(float(target_heading))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    ego_forward = np.asarray([math.cos(ego_yaw), math.sin(ego_yaw)], dtype=np.float32)
+    ego_right = np.asarray([-math.sin(ego_yaw), math.cos(ego_yaw)], dtype=np.float32)
+    road_forward_world = np.asarray([math.cos(road_yaw), math.sin(road_yaw)], dtype=np.float32)
+    road_right_world = np.asarray([-math.sin(road_yaw), math.cos(road_yaw)], dtype=np.float32)
+
+    center_delta = target_xy - ego_xy
+    center_local = np.asarray([center_delta @ ego_forward, center_delta @ ego_right], dtype=np.float32)
+    road_forward_local = np.asarray([road_forward_world @ ego_forward, road_forward_world @ ego_right], dtype=np.float32)
+    road_right_local = np.asarray([road_right_world @ ego_forward, road_right_world @ ego_right], dtype=np.float32)
+
+    half_length = float(args.target_road_overlay_length_m) * 0.5
+    half_width = float(args.target_road_overlay_width_m) * 0.5
+    corners = []
+    for forward_sign, right_sign in ((-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)):
+        local = (
+            center_local
+            + forward_sign * half_length * road_forward_local
+            + right_sign * half_width * road_right_local
+        )
+        col = int(round(width * 0.5 + float(local[1]) * ppm))
+        row = int(round(height * 0.5 - float(local[0]) * ppm))
+        corners.append((col, row))
+    return np.asarray(corners, dtype=np.int32)
+
 
 def wait_for_image(q: queue.Queue[Any], timeout: float) -> Any:
     try:
@@ -1884,40 +2190,128 @@ def write_video(path: pathlib.Path, frames: list[np.ndarray], fps: int) -> None:
             frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
         normalized_frames.append(frame[:, :, :3])
 
-    for out_path, fourcc in (
-        (path, "mp4v"),
-        (path.with_suffix(".avi"), "XVID") if path.suffix.lower() == ".mp4" else (None, ""),
-        (path.with_name(path.stem + "_mjpg.avi"), "MJPG") if path.suffix.lower() == ".mp4" else (None, ""),
-    ):
-        if out_path is None:
-            continue
-        writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*fourcc), float(fps), (width, height))
-        if not writer.isOpened():
-            continue
+    cleanup_video_sidecars(path)
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is not None:
+        codec_args, codec_name = pick_ffmpeg_encoder(ffmpeg)
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
+            "-an",
+            *codec_args,
+            "-movflags",
+            "+faststart",
+            str(path),
+        ]
         try:
-            for frame in normalized_frames:
-                writer.write(frame)
-        finally:
-            writer.release()
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        except Exception as exc:
+            print(f"WARNING: could not start ffmpeg ({exc}); falling back to OpenCV mp4v.", flush=True)
+        else:
+            try:
+                assert proc.stdin is not None
+                for frame in normalized_frames:
+                    proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+                proc.stdin.close()
+                return_code = proc.wait()
+                if return_code == 0:
+                    print(f"Wrote MP4 with ffmpeg encoder: {codec_name} -> {path}", flush=True)
+                    return
+            finally:
+                if proc.stdin is not None and not proc.stdin.closed:
+                    proc.stdin.close()
+                if proc.poll() is None:
+                    proc.kill()
+            print("WARNING: ffmpeg video encoding failed; falling back to OpenCV mp4v.", flush=True)
 
-    preview_pairs = (
-        ("first", 0),
-        ("middle", len(normalized_frames) // 2),
-        ("last", len(normalized_frames) - 1),
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open MP4 writer for {path}")
+    try:
+        for frame in normalized_frames:
+            writer.write(frame)
+    finally:
+        writer.release()
+    print(
+        "WARNING: wrote MP4 with OpenCV mp4v fallback. "
+        "If your viewer rejects it, install/use ffmpeg with an H.264 encoder.",
+        flush=True,
     )
-    for label, idx in preview_pairs:
-        cv2.imwrite(str(path.with_name(f"{path.stem}_{label}.jpg")), normalized_frames[idx])
-    thumbs = []
-    for idx in np.linspace(0, len(normalized_frames) - 1, num=min(12, len(normalized_frames)), dtype=int):
-        thumbs.append(cv2.resize(normalized_frames[int(idx)], (240, 135), interpolation=cv2.INTER_AREA))
-    rows = []
-    for row_start in range(0, len(thumbs), 4):
-        row = thumbs[row_start: row_start + 4]
-        if len(row) < 4:
-            row.extend([np.zeros_like(thumbs[0]) for _ in range(4 - len(row))])
-        rows.append(np.concatenate(row, axis=1))
-    if rows:
-        cv2.imwrite(str(path.with_name(f"{path.stem}_contact.jpg")), np.concatenate(rows, axis=0))
+
+
+def cleanup_video_sidecars(path: pathlib.Path) -> None:
+    sidecars = [
+        path.with_suffix(".avi"),
+        path.with_name(path.stem + "_mjpg.avi"),
+        path.with_name(path.stem + "_first.jpg"),
+        path.with_name(path.stem + "_middle.jpg"),
+        path.with_name(path.stem + "_last.jpg"),
+        path.with_name(path.stem + "_contact.jpg"),
+    ]
+    for sidecar in sidecars:
+        try:
+            if sidecar.exists():
+                sidecar.unlink()
+        except OSError:
+            pass
+
+
+def ffmpeg_encoders(ffmpeg: str) -> str:
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-encoders"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        return result.stdout
+    except Exception:
+        return ""
+
+
+def pick_ffmpeg_encoder(ffmpeg: str) -> tuple[list[str], str]:
+    encoders = ffmpeg_encoders(ffmpeg)
+    if " libx264 " in encoders:
+        return ["-vcodec", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"], "libx264"
+    if " libopenh264 " in encoders:
+        return ["-vcodec", "libopenh264", "-b:v", "2500k", "-pix_fmt", "yuv420p", "-tag:v", "avc1"], "libopenh264"
+    if " h264_nvenc " in encoders:
+        return ["-vcodec", "h264_nvenc", "-preset", "p4", "-b:v", "2500k", "-pix_fmt", "yuv420p", "-tag:v", "avc1"], "h264_nvenc"
+    if " mpeg4 " in encoders:
+        return ["-vcodec", "mpeg4", "-q:v", "4", "-pix_fmt", "yuv420p"], "mpeg4"
+    return ["-vcodec", "mpeg4", "-q:v", "4", "-pix_fmt", "yuv420p"], "mpeg4"
+
+
+def find_ffmpeg() -> str | None:
+    candidates = [
+        os.environ.get("TASK1_FFMPEG"),
+        os.environ.get("FFMPEG_BIN"),
+        shutil.which("ffmpeg"),
+        "/lab/haoq_lab/cse12312032/miniconda3/envs/simlingo/bin/ffmpeg",
+        "/lab/haoq_lab/cse12312032/miniconda3/envs/drivevla/bin/ffmpeg",
+        "/lab/haoq_lab/cse12312032/miniconda3/envs/openvla/bin/ffmpeg",
+    ]
+    existing = [candidate for candidate in candidates if candidate and pathlib.Path(candidate).exists()]
+    if not existing:
+        return None
+    for candidate in existing:
+        encoders = ffmpeg_encoders(candidate)
+        if any(name in encoders for name in (" libx264 ", " libopenh264 ", " h264_nvenc ")):
+            return candidate
+    return existing[0]
 
 
 def location_dict(location: Any) -> dict[str, float]:
@@ -2094,6 +2488,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--velocity-head-min-speed-mps", type=float, default=0.0)
     parser.add_argument("--velocity-head-max-speed-mps", type=float, default=8.0)
     parser.add_argument(
+        "--velocity-head-hz",
+        type=float,
+        default=5.0,
+        help="Velocity-head inference frequency. This affects only scalar speed control, not SimLingo route generation.",
+    )
+    parser.add_argument(
+        "--velocity-head-commands",
+        default="stop,speed up,slow down",
+        help="Comma-separated commands whose scalar speed is controlled by the velocity head.",
+    )
+    parser.add_argument(
         "--simlingo-input-mode",
         choices=("target_point_command", "command", "strict-command"),
         default="strict-command",
@@ -2128,11 +2533,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--simlingo-speed-control-mode",
-        choices=("route", "model"),
-        default="model",
+        choices=("route", "model", "model-speed-commands"),
+        default="model-speed-commands",
         help=(
             "Longitudinal control source. 'model' converts SimLingo's predicted speed waypoints into a scalar target speed; "
-            "'route' derives speed from command/route fallback settings."
+            "'route' derives speed from command/route fallback settings; "
+            "'model-speed-commands' uses model speed only for stop/speed-up/slow-down."
+        ),
+    )
+    parser.add_argument(
+        "--speed-command-route-source",
+        choices=("map", "model"),
+        default="map",
+        help=(
+            "Steering route source for stop/speed-up/slow-down tests. "
+            "'map' keeps lane-follow steering stable so the test measures scalar speed behavior; "
+            "'model' lets SimLingo route predictions control steering."
         ),
     )
     parser.add_argument(
@@ -2182,6 +2598,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cached-route-fast-speed-mps", type=float, default=6.0)
     parser.add_argument("--cached-route-slow-speed-mps", type=float, default=2.2)
     parser.add_argument("--cached-route-throttle-gain", type=float, default=0.25)
+    parser.add_argument(
+        "--cached-route-throttle-feedforward",
+        type=float,
+        default=0.0,
+        help="Constant throttle term used when tracking a positive speed error.",
+    )
+    parser.add_argument(
+        "--cached-route-speed-throttle-feedforward-gain",
+        type=float,
+        default=0.055,
+        help="Target-speed-proportional throttle term for scalar speed tracking.",
+    )
+    parser.add_argument(
+        "--cached-route-throttle-deadband-mps",
+        type=float,
+        default=0.05,
+        help="No-throttle band around the target speed to avoid creeping/oscillation.",
+    )
     parser.add_argument("--cached-route-max-throttle", type=float, default=0.65)
     parser.add_argument("--cached-route-brake-gain", type=float, default=0.35)
     parser.add_argument("--cached-route-max-brake", type=float, default=0.6)
@@ -2234,6 +2668,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Topdown overlay scale. <=0 derives scale from topdown camera height/FOV.",
     )
+    parser.add_argument("--target-road-overlay-length-m", type=float, default=34.0)
+    parser.add_argument("--target-road-overlay-width-m", type=float, default=8.0)
     parser.add_argument("--sensor-timeout", type=float, default=5.0)
     parser.add_argument("--sensor-warmup-ticks", type=int, default=40)
     parser.add_argument("--sensor-retry-ticks", type=int, default=10)
@@ -2263,6 +2699,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--route-planner-min-distance", type=float, default=20.0)
     parser.add_argument("--route-planner-max-distance", type=float, default=80.0)
     parser.add_argument("--junction-min-turn-deg", type=float, default=35.0)
+    parser.add_argument(
+        "--min-pre-junction-route-points",
+        type=int,
+        default=4,
+        help="Reject left/right/straight test spawns whose requested junction branch is too close to the spawn.",
+    )
+    parser.add_argument(
+        "--straight-require-junction",
+        action="store_true",
+        default=True,
+        help="Require straight trials to use an actual intersection straight branch.",
+    )
+    parser.add_argument(
+        "--no-straight-require-junction",
+        dest="straight_require_junction",
+        action="store_false",
+    )
     parser.add_argument("--straight-route-max-heading", type=float, default=12.0)
     parser.add_argument("--speed-route-max-heading", type=float, default=8.0)
 
@@ -2273,6 +2726,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stop-on-offroad", action="store_true", default=True)
     parser.add_argument("--no-stop-on-offroad", dest="stop_on_offroad", action="store_false")
     parser.add_argument("--target-road-depth-m", type=float, default=65.0)
+    parser.add_argument(
+        "--straight-target-depth-m",
+        type=float,
+        default=25.0,
+        help="Distance after the straight junction branch used for straight-command success.",
+    )
+    parser.add_argument(
+        "--straight-target-min-distance-m",
+        type=float,
+        default=40.0,
+        help="Minimum ego travel distance before a straight-through-intersection trial can succeed.",
+    )
+    parser.add_argument(
+        "--straight-post-junction-min-distance-m",
+        type=float,
+        default=10.0,
+        help="Minimum distance past the selected straight junction branch before straight can succeed.",
+    )
     parser.add_argument("--target-road-min-heading-deg", type=float, default=75.0)
     parser.add_argument("--target-road-reach-distance-m", type=float, default=8.0)
     parser.add_argument(

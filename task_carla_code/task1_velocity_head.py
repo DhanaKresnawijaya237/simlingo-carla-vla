@@ -13,7 +13,7 @@ import numpy as np
 
 
 BASIC_COMMANDS = ("turn left", "turn right", "straight", "stop", "speed up", "slow down")
-FEATURE_NAMES = (
+FEATURE_NAMES_V1 = (
     "command_turn_left",
     "command_turn_right",
     "command_straight",
@@ -25,6 +25,11 @@ FEATURE_NAMES = (
     "previous_throttle",
     "previous_brake",
 )
+FEATURE_NAMES_V2 = FEATURE_NAMES_V1 + (
+    "baseline_speed_mps",
+    "command_elapsed_sec",
+)
+FEATURE_NAMES = FEATURE_NAMES_V2
 
 
 def command_to_index(command: str) -> int:
@@ -40,25 +45,39 @@ def build_velocity_features(
     previous_steer: float = 0.0,
     previous_throttle: float = 0.0,
     previous_brake: float = 0.0,
+    baseline_speed_mps: float | None = None,
+    command_elapsed_sec: float = 0.0,
+    feature_names: tuple[str, ...] | list[str] = FEATURE_NAMES,
 ) -> np.ndarray:
-    features = np.zeros((len(FEATURE_NAMES),), dtype=np.float32)
-    features[command_to_index(command)] = 1.0
-    features[6] = float(current_speed_mps)
-    features[7] = float(previous_steer)
-    features[8] = float(previous_throttle)
-    features[9] = float(previous_brake)
+    normalized = command.strip().lower().replace("_", " ")
+    values = {name: 0.0 for name in feature_names}
+    command_name = f"command_{normalized.replace(' ', '_')}"
+    if command_name in values:
+        values[command_name] = 1.0
+    values["current_speed_mps"] = float(current_speed_mps)
+    values["previous_steer"] = float(previous_steer)
+    values["previous_throttle"] = float(previous_throttle)
+    values["previous_brake"] = float(previous_brake)
+    if "baseline_speed_mps" in values:
+        values["baseline_speed_mps"] = float(current_speed_mps if baseline_speed_mps is None else baseline_speed_mps)
+    if "command_elapsed_sec" in values:
+        values["command_elapsed_sec"] = float(command_elapsed_sec)
+    features = np.asarray([values[name] for name in feature_names], dtype=np.float32)
     return features
 
 
 def annotation_features(sample: dict[str, Any]) -> np.ndarray:
     ego_state = sample.get("ego_state") or {}
     control = sample.get("control") or {}
+    speed = float(ego_state.get("speed_mps", 0.0))
     return build_velocity_features(
         str(sample.get("command", "")),
-        float(ego_state.get("speed_mps", 0.0)),
+        speed,
         float(control.get("steer", 0.0)),
         float(control.get("throttle", 0.0)),
         float(control.get("brake", 0.0)),
+        baseline_speed_mps=float(sample.get("baseline_speed_mps", speed)),
+        command_elapsed_sec=float(sample.get("command_elapsed_sec", 0.0)),
     )
 
 
@@ -136,6 +155,7 @@ class VelocityHeadRuntime:
         self.device = device
         self.feature_mean = torch.tensor(self.config.feature_mean, dtype=torch.float32, device=device)
         self.feature_std = torch.tensor(self.config.feature_std, dtype=torch.float32, device=device).clamp_min(1e-6)
+        self.feature_names = list(self.config.feature_names)
 
     def predict(
         self,
@@ -144,6 +164,8 @@ class VelocityHeadRuntime:
         previous_steer: float = 0.0,
         previous_throttle: float = 0.0,
         previous_brake: float = 0.0,
+        baseline_speed_mps: float | None = None,
+        command_elapsed_sec: float = 0.0,
     ) -> float:
         with self.torch.no_grad():
             features_np = build_velocity_features(
@@ -152,6 +174,9 @@ class VelocityHeadRuntime:
                 previous_steer,
                 previous_throttle,
                 previous_brake,
+                baseline_speed_mps=baseline_speed_mps,
+                command_elapsed_sec=command_elapsed_sec,
+                feature_names=self.feature_names,
             )
             features = self.torch.tensor(features_np, dtype=self.torch.float32, device=self.device)
             features = (features - self.feature_mean) / self.feature_std
