@@ -319,7 +319,7 @@ class Task1SimLingoRunner:
         if self.args.command:
             results = [self.run_trial(normalize_command(self.args.command), 0)]
         else:
-            commands = list(BASIC_COMMANDS)
+            commands = parse_command_sequence(self.args.eval_commands) if self.args.eval_commands else list(BASIC_COMMANDS)
             results = []
             durations = parse_duration_overrides(self.args.eval_duration_overrides)
             base_duration = self.args.duration
@@ -339,6 +339,9 @@ class Task1SimLingoRunner:
         previous_control: Any | None,
         baseline_speed_mps: float | None = None,
         command_elapsed_sec: float = 0.0,
+        predicted_speed_waypoints: Any = None,
+        predicted_route: Any = None,
+        model_target_speed_mps: float | None = None,
     ) -> float | None:
         if self.velocity_head is None:
             return None
@@ -353,6 +356,9 @@ class Task1SimLingoRunner:
             previous_brake=previous_brake,
             baseline_speed_mps=baseline_speed_mps,
             command_elapsed_sec=command_elapsed_sec,
+            predicted_speed_waypoints=predicted_speed_waypoints,
+            predicted_route=predicted_route,
+            model_target_speed_mps=model_target_speed_mps,
         )
 
     def run_trial(self, command: str, trial_index: int) -> TrialResult:
@@ -459,6 +465,8 @@ class Task1SimLingoRunner:
             cached_route_created_step: int | None = None
             cached_model_target_speed_mps: float | None = None
             velocity_head_target_speed_mps: float | None = None
+            last_predicted_speed_waypoints: Any = None
+            last_predicted_route: Any = None
             cached_follow_diag: dict[str, Any] = {}
             cached_route_update_diag: dict[str, Any] = {}
             rate_limit_diag: dict[str, Any] = {}
@@ -501,6 +509,8 @@ class Task1SimLingoRunner:
                         control = self.policy.run_step(input_data, timestamp)
                         policy_latency_sec = time.time() - t0
                         diag_after_policy = self.policy.diagnostics()
+                        last_predicted_speed_waypoints = diag_after_policy.get("predicted_speed_waypoints")
+                        last_predicted_route = diag_after_policy.get("predicted_route")
                         predicted_route = extract_xy_points(diag_after_policy.get("predicted_route"))
                         cached_model_target_speed_mps = estimate_model_target_speed_mps(
                             diag_after_policy.get("predicted_speed_waypoints")
@@ -579,17 +589,16 @@ class Task1SimLingoRunner:
                                 if execution_command == "stop"
                                 else velocity_baseline_speed_mps
                             )
-                            # v7 semantic velocity-head training annotations do not carry
-                            # real command elapsed time, so this feature was constant zero
-                            # during training. Keep runtime in-distribution until we collect
-                            # elapsed-aware labels.
-                            velocity_command_elapsed_sec = 0.0
+                            velocity_command_elapsed_sec = max(0.0, timestamp - warmup_sec)
                             velocity_head_target_speed_mps = self.predict_velocity_head_speed(
                                 command=execution_command,
                                 vehicle=vehicle,
                                 previous_control=previous_control,
                                 baseline_speed_mps=head_baseline_speed_mps,
                                 command_elapsed_sec=velocity_command_elapsed_sec,
+                                predicted_speed_waypoints=last_predicted_speed_waypoints,
+                                predicted_route=last_predicted_route,
+                                model_target_speed_mps=cached_model_target_speed_mps,
                             )
                         control, cached_follow_diag = follow_cached_route(
                             vehicle,
@@ -811,6 +820,10 @@ class Task1SimLingoRunner:
                         "force_policy_on_command_change": self.args.force_policy_on_command_change,
                         "refresh_policy_on_route_exhaustion": self.args.refresh_policy_on_route_exhaustion,
                         "min_cached_route_ahead_points": self.args.min_cached_route_ahead_points,
+                        "speed_command_route_source": self.args.speed_command_route_source,
+                        "speed_route_avoid_junctions": self.args.speed_route_avoid_junctions,
+                        "min_pre_junction_route_points": self.args.min_pre_junction_route_points,
+                        "max_pre_junction_route_points": self.args.max_pre_junction_route_points,
                         "route_speed_scale": self.args.task1_route_speed_scale,
                         "max_throttle": self.args.task1_max_throttle,
                         "brake_ratio": self.args.task1_brake_ratio,
@@ -1342,11 +1355,39 @@ class Task1SimLingoRunner:
                             f"< {self.args.min_pre_junction_route_points}"
                         )
                         continue
+                    if (
+                        self.args.max_pre_junction_route_points > 0
+                        and int(branch_index) > self.args.max_pre_junction_route_points
+                    ):
+                        last_error = (
+                            f"junction branch too far branch_index={branch_index} "
+                            f"> {self.args.max_pre_junction_route_points}"
+                        )
+                        continue
                 if command == "straight" and self.args.straight_require_junction and not meta.get("branch_committed", False):
                     last_error = "straight route is not an intersection straight branch"
                     continue
                 if command == "straight" and abs(meta.get("route_heading_delta_deg", 0.0)) > self.args.straight_route_max_heading:
                     last_error = f"straight route drifts {meta.get('route_heading_delta_deg')}"
+                    continue
+                if command == "straight" and meta.get("straight_target_after_branch_forward_m") is not None:
+                    if float(meta["straight_target_after_branch_forward_m"]) < float(
+                        self.args.straight_post_junction_min_distance_m
+                    ):
+                        last_error = (
+                            "straight target not past branch "
+                            f"target_after_branch_forward={meta['straight_target_after_branch_forward_m']:.2f}"
+                        )
+                        continue
+                if command in SPEED_EVAL_COMMANDS and wp.is_junction:
+                    last_error = "speed command spawn starts inside junction"
+                    continue
+                if (
+                    command in SPEED_EVAL_COMMANDS
+                    and self.args.speed_route_avoid_junctions
+                    and int(meta.get("junction_points", 0)) > 0
+                ):
+                    last_error = f"speed route crosses junctions junction_points={meta.get('junction_points')}"
                     continue
                 if command in SPEED_EVAL_COMMANDS and abs(meta.get("route_heading_delta_deg", 0.0)) > self.args.speed_route_max_heading:
                     last_error = f"speed route drifts {meta.get('route_heading_delta_deg')}"
@@ -1384,9 +1425,12 @@ class Task1SimLingoRunner:
     def build_lane_follow_route(self, start_wp: Any, command: str, route_length_m: float) -> tuple[list[tuple[Any, Any]], dict[str, Any]]:
         route: list[tuple[Any, Any]] = []
         current = start_wp
+        junction_points = 0
         steps = max(5, int(route_length_m / self.args.route_step_m))
         for _ in range(steps):
             route.append((current.transform, self.RoadOption.LANEFOLLOW))
+            if current.is_junction:
+                junction_points += 1
             nxt = current.next(self.args.route_step_m)
             if not nxt:
                 break
@@ -1396,6 +1440,7 @@ class Task1SimLingoRunner:
             "reason": "lane-follow route",
             "route_heading_delta_deg": float(heading_delta),
             "route_points": len(route),
+            "junction_points": int(junction_points),
         }
 
     def build_intersection_route(self, start_wp: Any, command: str) -> tuple[list[tuple[Any, Any]], dict[str, Any]]:
@@ -1448,6 +1493,10 @@ class Task1SimLingoRunner:
         target_road_heading_deg = None
         target_road_route_index = None
         branch_point = None
+        straight_branch_forward_from_start_m = None
+        straight_target_forward_from_start_m = None
+        straight_target_after_branch_forward_m = None
+        straight_target_lateral_from_start_m = None
         if branch_index is not None and route:
             branch_point = location_dict(route[branch_index][0].location)
             target_depth_m = (
@@ -1471,6 +1520,23 @@ class Task1SimLingoRunner:
                 target_lane_id = int(target_wp.lane_id)
                 target_road_heading_deg = float(target_wp.transform.rotation.yaw)
                 target_road_point = location_dict(target_wp.transform.location)
+            if command == "straight" and branch_point is not None:
+                start_loc = start_wp.transform.location
+                start_yaw = math.radians(float(start_wp.transform.rotation.yaw))
+                forward_x = math.cos(start_yaw)
+                forward_y = math.sin(start_yaw)
+                right_x = -math.sin(start_yaw)
+                right_y = math.cos(start_yaw)
+                branch_dx = float(route[branch_index][0].location.x) - float(start_loc.x)
+                branch_dy = float(route[branch_index][0].location.y) - float(start_loc.y)
+                target_dx = float(target_loc.x) - float(start_loc.x)
+                target_dy = float(target_loc.y) - float(start_loc.y)
+                straight_branch_forward_from_start_m = float(branch_dx * forward_x + branch_dy * forward_y)
+                straight_target_forward_from_start_m = float(target_dx * forward_x + target_dy * forward_y)
+                straight_target_after_branch_forward_m = float(
+                    straight_target_forward_from_start_m - straight_branch_forward_from_start_m
+                )
+                straight_target_lateral_from_start_m = float(abs(target_dx * right_x + target_dy * right_y))
         return route, {
             "reason": "junction route" if branch_committed else "straight continuation route",
             "branch_committed": branch_committed,
@@ -1485,6 +1551,10 @@ class Task1SimLingoRunner:
             "target_lane_id": target_lane_id,
             "target_road_heading_deg": target_road_heading_deg,
             "target_road_point": target_road_point,
+            "straight_branch_forward_from_start_m": straight_branch_forward_from_start_m,
+            "straight_target_forward_from_start_m": straight_target_forward_from_start_m,
+            "straight_target_after_branch_forward_m": straight_target_after_branch_forward_m,
+            "straight_target_lateral_from_start_m": straight_target_lateral_from_start_m,
         }
 
     def choose_branch(self, current: Any, successors: list[Any], command: str) -> tuple[Any | None, float, str]:
@@ -2534,17 +2604,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--simlingo-speed-control-mode",
         choices=("route", "model", "model-speed-commands"),
-        default="model-speed-commands",
+        default="model",
         help=(
             "Longitudinal control source. 'model' converts SimLingo's predicted speed waypoints into a scalar target speed; "
             "'route' derives speed from command/route fallback settings; "
-            "'model-speed-commands' uses model speed only for stop/speed-up/slow-down."
+            "'model-speed-commands' uses model speed only after a stop/speed-up/slow-down command becomes active, "
+            "so its straight warmup uses route fallback speed."
         ),
     )
     parser.add_argument(
         "--speed-command-route-source",
         choices=("map", "model"),
-        default="map",
+        default="model",
         help=(
             "Steering route source for stop/speed-up/slow-down tests. "
             "'map' keeps lane-follow steering stable so the test measures scalar speed behavior; "
@@ -2636,6 +2707,13 @@ def build_parser() -> argparse.ArgumentParser:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--command", choices=BASIC_COMMANDS)
     group.add_argument("--eval-suite", choices=("basic",))
+    parser.add_argument(
+        "--eval-commands",
+        help=(
+            "Optional comma-separated subset of Task 1 commands to run with --eval-suite. "
+            "Example: 'stop,speed up,slow down'."
+        ),
+    )
     parser.add_argument("--trials-per-command", type=int, default=1)
     parser.add_argument("--duration", type=float, default=12.0)
     parser.add_argument(
@@ -2706,6 +2784,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reject left/right/straight test spawns whose requested junction branch is too close to the spawn.",
     )
     parser.add_argument(
+        "--max-pre-junction-route-points",
+        type=int,
+        default=24,
+        help=(
+            "Reject left/right/straight test spawns whose requested junction branch is too far from the spawn. "
+            "Set <=0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--straight-require-junction",
         action="store_true",
         default=True,
@@ -2718,6 +2805,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--straight-route-max-heading", type=float, default=12.0)
     parser.add_argument("--speed-route-max-heading", type=float, default=8.0)
+    parser.add_argument(
+        "--speed-route-avoid-junctions",
+        action="store_true",
+        default=True,
+        help="For stop/speed-up/slow-down, prefer long smooth non-junction lane-follow scenarios.",
+    )
+    parser.add_argument(
+        "--no-speed-route-avoid-junctions",
+        dest="speed_route_avoid_junctions",
+        action="store_false",
+    )
 
     parser.add_argument("--target-success-rate", type=float, default=0.80)
     parser.add_argument("--success-hold-sec", type=float, default=1.0)

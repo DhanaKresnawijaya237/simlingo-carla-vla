@@ -171,3 +171,4 @@ cython_debug/
 logs
 .carla_client_py
 .carla_import_compat
+report/
